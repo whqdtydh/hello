@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>配置服务器域名</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: #f5f5f5;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .modal {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+            width: 100%;
+            max-width: 900px;
+            padding: 30px 40px;
+            position: relative;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 40px;
+        }
+
+        .modal-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .close-btn {
+            width: 32px;
+            height: 32px;
+            border: none;
+            background: none;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #999;
+            font-size: 24px;
+            transition: color 0.2s;
+        }
+
+        .close-btn:hover {
+            color: #666;
+        }
+
+        .form-group {
+            display: flex;
+            align-items: flex-start;
+            margin-bottom: 28px;
+        }
+
+        .form-label {
+            width: 160px;
+            font-size: 14px;
+            color: #666;
+            padding-top: 12px;
+            flex-shrink: 0;
+        }
+
+        .form-input {
+            flex: 1;
+            padding: 12px 16px;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            font-size: 14px;
+            color: #333;
+            transition: border-color 0.2s;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: #07c160;
+        }
+
+        .form-input::placeholder {
+            color: #bbb;
+        }
+
+        .form-textarea {
+            flex: 1;
+            padding: 12px 16px;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            font-size: 14px;
+            color: #333;
+            min-height: 60px;
+            resize: vertical;
+            font-family: inherit;
+            transition: border-color 0.2s;
+        }
+
+        .form-textarea:focus {
+            outline: none;
+            border-color: #07c160;
+        }
+
+        .form-textarea::placeholder {
+            color: #bbb;
+        }
+
+        .modal-footer {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            margin-top: 40px;
+            padding-top: 20px;
+        }
+
+        .btn {
+            padding: 10px 32px;
+            border-radius: 4px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+            border: 1px solid transparent;
+        }
+
+        .btn-primary {
+            background-color: #07c160;
+            color: white;
+            border-color: #07c160;
+        }
+
+        .btn-primary:hover {
+            background-color: #06ad56;
+        }
+
+        .btn-secondary {
+            background-color: white;
+            color: #333;
+            border-color: #e0e0e0;
+        }
+
+        .btn-secondary:hover {
+            background-color: #f5f5f5;
+        }
+
+        .hint {
+            font-size: 12px;
+            color: #999;
+            margin-top: 6px;
+        }
+    </style>
+</head>
+<body>
+    <div class="modal">
+        <div class="modal-header">
+            <h2 class="modal-title">配置服务器域名</h2>
+            <button class="close-btn" onclick="closeModal()">×</button>
+        </div>
+
+        <form id="domainForm">
+            <div class="form-group">
+                <label class="form-label">request合法域名</label>
+                <input type="text" class="form-input" placeholder="以 https:// 开头。可填写5个域名，域名间请用；分割">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">socket合法域名</label>
+                <input type="text" class="form-input" placeholder="以 wss:// 开头。可填写5个域名，域名间请用；分割">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">uploadFile合法域名</label>
+                <input type="text" class="form-input" placeholder="以 https:// 开头。可填写5个域名，域名间请用；分割">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">downloadFile合法域名</label>
+                <input type="text" class="form-input" placeholder="以 https:// 开头。可填写5个域名，域名间请用；分割">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">udp合法域名</label>
+                <input type="text" class="form-input" placeholder="以 udp:// 开头。可填写5个域名，域名间请用；分割">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">tcp合法域名</label>
+                <input type="text" class="form-input" placeholder="以 tcp:// 开头。可填写5个域名，域名间请用；分割">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">DNS预解析域名</label>
+                <textarea class="form-textarea" placeholder="该域名无需填写协议头，最多填写5个域名，域名间请用；分割"></textarea>
+            </div>
+
+            <div class="form-group">
+                <label class="form-label">预连接域名</label>
+                <textarea class="form-textarea" placeholder="以 https:// 开头，且需要为request合法域名与DNS预解析域名的子集，可填写5个域名，域名间请用；分割"></textarea>
+            </div>
+        </form>
+
+        <div class="modal-footer">
+            <button type="button" class="btn btn-primary" onclick="saveAndSubmit()">保存并提交</button>
+            <button type="button" class="btn btn-secondary" onclick="closeModal()">取消</button>
+        </div>
+    </div>
+
+    <script>
+        function closeModal() {
+            if (confirm('确定要取消吗？未保存的更改将丢失。')) {
+                document.getElementById('domainForm').reset();
+            }
+        }
+
+        function saveAndSubmit() {
+            const formData = new FormData(document.getElementById('domainForm'));
+            const data = {};
+            
+            // 收集所有表单数据
+            const inputs = document.querySelectorAll('.form-input, .form-textarea');
+            inputs.forEach((input, index) => {
+                const labels = ['request合法域名', 'socket合法域名', 'uploadFile合法域名', 
+                              'downloadFile合法域名', 'udp合法域名', 'tcp合法域名', 
+                              'DNS预解析域名', '预连接域名'];
+                data[labels[index]] = input.value;
+            });
+            
+            console.log('提交的数据:', data);
+            alert('保存成功！');
+        }
+
+        // 添加输入验证
+        document.querySelectorAll('.form-input').forEach(input => {
+            input.addEventListener('blur', function() {
+                const placeholder = this.placeholder;
+                const value = this.value.trim();
+                
+                if (value && !validateInput(value, placeholder)) {
+                    this.style.borderColor = '#ff4d4f';
+                } else {
+                    this.style.borderColor = '#e0e0e0';
+                }
+            });
+        });
+
+        function validateInput(value, placeholder) {
+            const domains = value.split('；').map(d => d.trim()).filter(d => d);
+            
+            if (domains.length > 5) {
+                alert('最多只能填写5个域名');
+                return false;
+            }
+            
+            for (const domain of domains) {
+                if (placeholder.includes('https://') && !domain.startsWith('https://')) {
+                    alert('域名必须以 https:// 开头');
+                    return false;
+                }
+                if (placeholder.includes('wss://') && !domain.startsWith('wss://')) {
+                    alert('域名必须以 wss:// 开头');
+                    return false;
+                }
+                if (placeholder.includes('udp://') && !domain.startsWith('udp://')) {
+                    alert('域名必须以 udp:// 开头');
+                    return false;
+                }
+                if (placeholder.includes('tcp://') && !domain.startsWith('tcp://')) {
+                    alert('域名必须以 tcp:// 开头');
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+    </script>
+</body>
+</html>

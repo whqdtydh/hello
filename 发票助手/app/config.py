@@ -1,0 +1,71 @@
+"""全局配置：路径、选择器、常量。选择器集中在此便于 QQ 邮箱改版后快速适配。"""
+
+import os
+
+# 系统 Edge 浏览器路径（复用本机浏览器，免下载 Playwright Chromium）
+EDGE_EXECUTABLE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
+# 邮箱登录会话 profile 保存目录（实现二次免登录）
+PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "edge_profile")
+
+# QtWebEngine 持久化目录（cookie / 缓存 / 本地存储）
+_PROFILE_BASE = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "webengine")
+PROFILE_CACHE_DIR = os.path.join(_PROFILE_BASE, "cache")
+PROFILE_STORAGE_DIR = os.path.join(_PROFILE_BASE, "storage")
+
+# QQ 邮箱首页（登录入口 + 收件箱）
+MAIL_HOME = "https://wx.mail.qq.com/home/index"
+
+# 报销文件夹 URL（QQ 邮箱 -> 我的文件夹 -> 报销）
+DEFAULT_MAIL_URL = "https://wx.mail.qq.com/home/index#/list/2000"
+
+# 默认保存目录：桌面\车辆报销
+DEFAULT_SAVE_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "车辆报销")
+
+# ---------- CSS 选择器（QQ 邮箱网页版，2026-08 验证可用） ----------
+MAIL_ITEM = "div[class*=list-item]"                 # 邮件列表项
+ATTACH_LIST = "div.mail-detail-attaches"            # 附件列表容器
+ATTACH_CARD = ".mail-detail-attach-card"            # 单个附件卡片
+ATTACH_NAME = ".attach-name"                        # 附件名（不含后缀）
+ATTACH_SUFFIX = ".attach-suffix"                    # 附件后缀（.pdf/.xml/.ofd）
+ATTACH_SIZE = ".attach-size"                        # 附件大小
+CARD_DOWNLOAD_BTN = "text=下载"                     # 卡片上的下载按钮
+BACK_BTN = "text=返回"                              # 返回列表按钮
+
+# 登录成功判定：页面标题或正文出现该标记
+LOGIN_MARKER = "收件箱"
+
+# 需要跳过的非发票邮件关键字
+SKIP_KEYWORDS = ("工作日报", "日报", "汇报")
+
+# 视为发票邮件的发件人关键字（为空则不限制发件人，仅按附件筛选）
+INVOICE_FROM_KEYWORDS = ("itinerary", "fapiao")
+
+# 每封邮件仅下载这些后缀的附件（电子发票 PDF + 电子行程单 PDF）
+PDF_SUFFIX = ".pdf"
+
+# ---------- IMAP 凭据持久化 ----------
+import json
+
+_CRED_FILE = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "imap_cred.json")
+
+
+def save_imap_cred(account, auth_code):
+    """保存 IMAP 账号与授权码到用户目录。"""
+    try:
+        os.makedirs(os.path.dirname(_CRED_FILE), exist_ok=True)
+        with open(_CRED_FILE, "w", encoding="utf-8") as f:
+            json.dump({"account": account, "auth_code": auth_code}, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def load_imap_cred():
+    """读取已保存的 IMAP 账号与授权码，没有则返回 ("", "")。"""
+    try:
+        with open(_CRED_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d.get("account", ""), d.get("auth_code", "")
+    except Exception:
+        return "", ""

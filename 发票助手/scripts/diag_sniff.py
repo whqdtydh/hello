@@ -1,6 +1,11 @@
 """诊断：点击下载按钮 -> 拦截器捕获 URL -> requests+cookie 拉取，验证整条链路。"""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import os
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -18,9 +23,8 @@ web.log_signal.connect(lambda m: log.append(m))
 
 def open_first():
     log.append(f"click_mail(0) -> {web.click_mail(0)}")
-    import time as _t
-    dl = _t.time() + 30
-    while _t.time() < dl:
+    dl = time.time() + 30
+    while time.time() < dl:
         if web.mail_detail_ready():
             log.append("详情已就绪")
             return
@@ -28,9 +32,8 @@ def open_first():
     log.append("详情未就绪")
 
 def wait_attachments(timeout=15):
-    import time as _t
-    dl = _t.time() + timeout
-    while _t.time() < dl:
+    dl = time.time() + timeout
+    while time.time() < dl:
         atts = web.get_attachments()
         if atts:
             return atts
@@ -58,7 +61,6 @@ def test_download():
     for u in urls:
         log.append("  " + u[:150])
     if urls:
-        from concurrent.futures import ThreadPoolExecutor
         dest = r"C:\Users\48641\Desktop\车辆报销\_test_sniff.pdf"
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:

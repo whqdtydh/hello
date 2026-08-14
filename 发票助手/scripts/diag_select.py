@@ -1,7 +1,9 @@
 """诊断勾选检测：加载报销文件夹，用户登录并勾选邮件后，打印每封邮件的 checkbox 状态。
 用 QTimer 轮询登录态，登录后自动导航到报销文件夹并等待用户勾选。"""
-import sys, os, time
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit

@@ -1,6 +1,9 @@
 """诊断：从邮件详情页 DOM 查找 mailid / fileid 相关信息，探索免点击直接构造下载URL。"""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -8,10 +11,15 @@ from app.engine.web_client import WebClient
 from app import config
 
 app = QApplication(sys.argv)
-win = QWidget(); win.setWindowTitle("诊断-mailid/fileid"); win.resize(1000, 680)
+win = QWidget()
+win.setWindowTitle("诊断-mailid/fileid")
+win.resize(1000, 680)
 lay = QVBoxLayout(win)
-view = QWebEngineView(); lay.addWidget(view, 4)
-log = QTextEdit(); log.setReadOnly(True); lay.addWidget(log, 1)
+view = QWebEngineView()
+lay.addWidget(view, 4)
+log = QTextEdit()
+log.setReadOnly(True)
+lay.addWidget(log, 1)
 
 web = WebClient(view)
 
@@ -62,10 +70,10 @@ def probe():
 b = QPushButton("打开第一封并探测"); lay.addWidget(b)
 def go():
     web.click_mail(0)
-    import time as _t
-    dl=_t.time()+30
-    while _t.time()<dl:
-        if web.mail_detail_ready(): break
+    dl = time.time() + 30
+    while time.time() < dl:
+        if web.mail_detail_ready():
+            break
         web.qt_sleep(0.5)
     probe()
 b.clicked.connect(go)

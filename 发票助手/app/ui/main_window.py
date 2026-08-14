@@ -5,20 +5,22 @@
 速度远快于网页嗅探方式。
 """
 
+import sys
 import threading
 
 from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont
+from PySide6.QtWebEngineCore import QWebEngineProfile
+from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QLabel, QLineEdit, QPushButton, QFileDialog,
     QProgressBar, QTextEdit, QMessageBox, QFrame,
 )
-from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from app import config
-from app.engine.web_client import WebClient
 from app.engine.imap_engine import ImapEngine
+from app.engine.web_client import WebClient
 
 
 def _styles():
@@ -178,7 +180,7 @@ class MainWindow(QWidget):
         self.setObjectName("Root")
         self.setStyleSheet(_styles())
         self._build_ui(profile)
-        self.log_signal.connect(self._log_slot)
+        self.log_signal.connect(self._log)
         self.progress_signal.connect(self._progress_slot)
         self.done_signal.connect(self._done_slot)
         self.error_signal.connect(self._error_slot)
@@ -362,9 +364,6 @@ class MainWindow(QWidget):
         sb = self.log_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _log_slot(self, msg):
-        self._log(msg)
-
     def _progress_slot(self, processed, total, downloaded):
         self._stop_busy()
         self.progress.setRange(0, max(total, 1))
@@ -483,34 +482,39 @@ class MainWindow(QWidget):
         self.progress.setFormat(f"读取勾选 {len(mails)} 封 · 开始连接…")
         self._set_status("连接邮箱…", "busy")
 
-        def worker():
-            engine = ImapEngine(
-                account, auth,
-                on_log=self.log_signal.emit,
-                on_progress=self.progress_signal.emit,
-            )
-            self.engine = engine
-            try:
-                engine.connect()
-                self.log_signal.emit("[状态] 已连接邮箱")
-                # 连接成功即保存凭据，后续免输入
-                config.save_imap_cred(account, auth)
-                files = engine.download_selected_pdfs(dest, mails)
-                self.done_signal.emit(files)
-            except Exception as e:
-                self.log_signal.emit("❌ " + str(e))
-                if "login" in str(e).lower() or "AUTHENTICATION" in str(e).upper():
-                    self.log_signal.emit("⚠ 授权码可能已失效，请重新输入后再试。")
-                    config.save_imap_cred("", "")
-                self.done_signal.emit([])
-                self.error_signal.emit(str(e))
-            finally:
-                try:
-                    engine.logout()
-                except Exception:
-                    pass
+        threading.Thread(
+            target=self._run_download,
+            args=(account, auth, dest, mails),
+            daemon=True,
+        ).start()
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _run_download(self, account, auth, dest, mails):
+        """后台线程：连接 IMAP 并下载勾选邮件对应的 PDF。"""
+        engine = ImapEngine(
+            account, auth,
+            on_log=self.log_signal.emit,
+            on_progress=self.progress_signal.emit,
+        )
+        self.engine = engine
+        try:
+            engine.connect()
+            self.log_signal.emit("[状态] 已连接邮箱")
+            # 连接成功即保存凭据，后续免输入
+            config.save_imap_cred(account, auth)
+            files = engine.download_selected_pdfs(dest, mails)
+            self.done_signal.emit(files)
+        except Exception as e:
+            self.log_signal.emit("❌ " + str(e))
+            if "login" in str(e).lower() or "AUTHENTICATION" in str(e).upper():
+                self.log_signal.emit("⚠ 授权码可能已失效，请重新输入后再试。")
+                config.save_imap_cred("", "")
+            self.done_signal.emit([])
+            self.error_signal.emit(str(e))
+        finally:
+            try:
+                engine.logout()
+            except Exception:
+                pass
 
     def on_stop(self):
         if self.engine:
@@ -537,9 +541,6 @@ class MainWindow(QWidget):
 
 
 def run():
-    import sys
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtWebEngineCore import QWebEngineProfile
     app = QApplication(sys.argv)
     # 用自定义 profile 并显式设置持久化路径（默认 profile 在 PySide6 6.11
     # 下持久化设置不生效，导致每次重启都要重新登录）。

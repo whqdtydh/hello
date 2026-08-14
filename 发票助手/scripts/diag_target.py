@@ -1,15 +1,16 @@
 """诊断：确认 _target_folders 返回值和各文件夹搜索命中情况。"""
-import sys, os, json
-sys.path.insert(0, r"D:\AI\git 地址\发票助手")
-
-from app.engine.imap_engine import (
-    ImapEngine, _utf7_encode, _imap_search,
-)
 import email
+import sys
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 
-cred = json.load(open(os.path.join(os.path.expanduser("~"), ".invoice_assistant", "imap_cred.json"), encoding="utf-8"))
-eng = ImapEngine(cred["account"], cred["auth_code"], on_log=print)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app import config
+from app.engine.imap_engine import ImapEngine, _imap_search, _utf7_encode
+
+account, auth = config.load_imap_cred()
+eng = ImapEngine(account, auth, on_log=print)
 eng.connect()
 
 print("=== list_folders() 原始 ===")

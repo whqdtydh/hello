@@ -5,19 +5,22 @@
 （不重放 URL、不依赖 cookie 抓取，速度快且稳定），同时保留嗅探 URL 兜底。
 """
 
+import json
 import os
 import time
 
-from PySide6.QtCore import QEventLoop, QTimer, QObject, Signal
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWebEngineCore import (
-    QWebEngineUrlRequestInterceptor,
-    QWebEngineDownloadRequest,
-)
-
 import requests
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
+from PySide6.QtWebEngineCore import (
+    QWebEngineDownloadRequest,
+    QWebEngineProfile,
+    QWebEngineScript,
+    QWebEngineUrlRequestInterceptor,
+)
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from app import config
+from app.engine.cookie_store import CookieStore
 
 
 class AttachmentInterceptor(QWebEngineUrlRequestInterceptor):
@@ -35,8 +38,7 @@ class AttachmentInterceptor(QWebEngineUrlRequestInterceptor):
 
     def interceptRequest(self, info):
         url = info.requestUrl().toString().lower()
-        hit = any(h in url for h in self.DOWNLOAD_HINTS)
-        if hit:
+        if any(h in url for h in self.DOWNLOAD_HINTS):
             self._urls.append(info.requestUrl().toString())
             # 不 block：让浏览器继续发请求（保持会话一致），下载结果由 requests 拉取。
 
@@ -53,7 +55,6 @@ class WebClient(QObject):
         self.profile = self.page.profile()
 
         # 持久化会话（cookie 保存到磁盘，重启后免登录）
-        from PySide6.QtWebEngineCore import QWebEngineProfile
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
         self.profile.setCachePath(config.PROFILE_CACHE_DIR)
@@ -65,20 +66,8 @@ class WebClient(QObject):
         self.profile.setUrlRequestInterceptor(self._interceptor)
         self.profile.downloadRequested.connect(self._on_download_requested)
 
-        # cookie 常驻收集器：PySide6 6.11 已移除 cookiesForUrl，
-        # 改为监听 cookieAdded + loadAllCookies 收集全部 cookie。
-        import threading
-        self._cookies = {}
-        self._cookie_lock = threading.Lock()
-        self._cookie_store = self.profile.cookieStore()
-        self._cookie_store.cookieAdded.connect(self._on_cookie_added)
-        self._cookie_store.loadAllCookies()
-
-        # 手动 cookie 持久化：QtWebEngine 内置持久化在 PySide6 下不可靠，
-        # 改为把收集到的 cookie 存 JSON，启动时注入回 cookie store。
-        self._cookie_file = os.path.join(
-            os.path.expanduser("~"), ".invoice_assistant", "web_cookies.json")
-        self._load_cookies()
+        # cookie 收集器（请求时供 requests 复用会话）
+        self.cookies = CookieStore(self.profile, config.COOKIE_FILE)
 
         self.pending_dest = None          # 兼容旧接口：单目标路径
         self._pending_dests = []          # 批量下载目标路径队列
@@ -117,11 +106,10 @@ class WebClient(QObject):
 
     def run_js_obj(self, script, timeout=20000):
         """执行 JS，自动把 JSON 字符串解析为 Python 对象。"""
-        import json as _json
         value = self.run_js(script, timeout=timeout)
         if isinstance(value, str):
             try:
-                return _json.loads(value)
+                return json.loads(value)
             except Exception:
                 return value
         return value
@@ -285,7 +273,6 @@ class WebClient(QObject):
 
     def _install_tracker(self):
         """把勾选监听脚本注入 profile（所有页面加载都会执行）。"""
-        from PySide6.QtWebEngineCore import QWebEngineScript
         for old in self.profile.scripts().find('invoice_tracker'):
             self.profile.scripts().remove(old)
         script = QWebEngineScript()
@@ -387,12 +374,12 @@ class WebClient(QObject):
         raw = self.run_js(js, timeout=8000)
         if not raw:
             return None
-        import json as _json
         try:
-            return _json.loads(raw)
+            return json.loads(raw)
         except Exception:
             return None
 
+    # ---------- 页面原子操作 ----------
     def click_mail(self, index):
         js = (
             "(function(){"
@@ -532,7 +519,7 @@ class WebClient(QObject):
                            "Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
             "Referer": referer or "https://wx.mail.qq.com/",
         }
-        cookie_jar = self.get_cookie_jar(url)
+        cookie_jar = self.cookies.get_cookie_jar(url)
         with requests.get(url, headers=headers, cookies=cookie_jar,
                           stream=True, timeout=60) as r:
             r.raise_for_status()
@@ -540,118 +527,3 @@ class WebClient(QObject):
                 for chunk in r.iter_content(chunk_size=65536):
                     f.write(chunk)
         return dest_path
-
-    def _on_cookie_added(self, cookie):
-        """收集 QtWebEngine cookie store 中的全部 cookie（键 = domain+name）。"""
-        from PySide6.QtCore import QByteArray
-
-        def _s(v):
-            if isinstance(v, QByteArray):
-                return bytes(v).decode("utf-8", "replace")
-            return str(v)
-
-        try:
-            domain = _s(cookie.domain())
-            name = _s(cookie.name())
-            if name:
-                with self._cookie_lock:
-                    self._cookies[(domain, name)] = cookie
-        except Exception:
-            pass
-        self._save_cookies()
-
-    def _load_cookies(self):
-        """启动时把已保存的 cookie 注入 QtWebEngine cookie store。"""
-        try:
-            import json
-            with open(self._cookie_file, "r", encoding="utf-8") as f:
-                items = json.load(f)
-        except Exception:
-            return
-        from PySide6.QtCore import QDateTime, QByteArray, QUrl
-        from PySide6.QtNetwork import QNetworkCookie
-
-        now = QDateTime.currentDateTime().toSecsSinceEpoch()
-        for item in items:
-            try:
-                if item.get("expires") and float(item["expires"]) < now:
-                    continue
-                domain = item.get("domain", "")
-                name = item.get("name", "")
-                value = item.get("value", "")
-                path = item.get("path", "/")
-                cookie = QNetworkCookie(
-                    QByteArray(bytes(name, "utf-8")),
-                    QByteArray(bytes(value, "utf-8")),
-                )
-                cookie.setDomain(domain)
-                cookie.setPath(path)
-                if item.get("secure"):
-                    cookie.setSecure(True)
-                self._cookie_store.setCookie(cookie, QUrl("https://" + domain.lstrip(".")))
-            except Exception:
-                continue
-
-    def _save_cookies(self):
-        """把收集到的 cookie 写入 JSON 文件。"""
-        try:
-            import json
-            from PySide6.QtCore import QByteArray, QDateTime
-            now = QDateTime.currentDateTime().toSecsSinceEpoch()
-
-            def _s(v):
-                if isinstance(v, QByteArray):
-                    return bytes(v).decode("utf-8", "replace")
-                return str(v)
-
-            out = []
-            with self._cookie_lock:
-                items = list(self._cookies.values())
-            for c in items:
-                try:
-                    out.append({
-                        "domain": _s(c.domain()),
-                        "name": _s(c.name()),
-                        "value": _s(c.value()),
-                        "path": _s(c.path()),
-                        "secure": bool(c.isSecure()),
-                        "expires": c.expirationDate().toSecsSinceEpoch()
-                        if c.expirationDate().isValid() and
-                        c.expirationDate().toSecsSinceEpoch() > now else 0,
-                    })
-                except Exception:
-                    continue
-            os.makedirs(os.path.dirname(self._cookie_file), exist_ok=True)
-            with open(self._cookie_file, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False)
-        except Exception:
-            pass
-
-    def get_cookie_jar(self, url):
-        """从已收集的 cookie 中按域名过滤，返回 requests CookieJar。
-
-        注意：cookie 由 __init__ 中常驻的 cookieAdded 信号 + loadAllCookies
-        持续收集到 self._cookies。本方法只读内存，可安全在 worker 线程调用
-        （不含任何 Qt 事件循环操作）。
-        """
-        from urllib.parse import urlparse
-
-        host = (urlparse(url).netloc or "").lower()
-
-        def _s(v):
-            from PySide6.QtCore import QByteArray
-            if isinstance(v, QByteArray):
-                return bytes(v).decode("utf-8", "replace")
-            return str(v)
-
-        jar = requests.cookies.RequestsCookieJar()
-        with self._cookie_lock:
-            items = list(self._cookies.items())
-        for (domain, name), c in items:
-            d = _s(c.domain()).lstrip(".")
-            if host == d or host.endswith("." + d):
-                value = _s(c.value())
-                path = _s(c.path()) or "/"
-                secure = bool(c.isSecure())
-                jar.set(name, value, domain=d, path=path, secure=secure)
-        return jar

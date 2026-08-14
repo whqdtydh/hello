@@ -10,6 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 from app import config
+from app.engine.mail_parse import ticket_amount
 from app.engine.web_client import WebClient
 
 
@@ -89,8 +90,7 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None):
         label = kind
     if not amount and msg is not None:
         try:
-            from app.engine.imap_engine import _ticket_amount
-            amt = _ticket_amount(msg)
+            amt = ticket_amount(msg)
             if amt:
                 amount = f"{amt:.2f}"
         except Exception:

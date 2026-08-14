@@ -1,6 +1,8 @@
 """诊断 run_js 返回值：测试基本类型与复杂对象，定位 JS 返回 None 的原因。"""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -8,10 +10,15 @@ from app.engine.web_client import WebClient
 from app import config
 
 app = QApplication(sys.argv)
-win = QWidget(); win.setWindowTitle("诊断-JS返回值"); win.resize(1000, 680)
+win = QWidget()
+win.setWindowTitle("诊断-JS返回值")
+win.resize(1000, 680)
 lay = QVBoxLayout(win)
-view = QWebEngineView(); lay.addWidget(view, 4)
-log = QTextEdit(); log.setReadOnly(True); lay.addWidget(log, 1)
+view = QWebEngineView()
+lay.addWidget(view, 4)
+log = QTextEdit()
+log.setReadOnly(True)
+lay.addWidget(log, 1)
 
 web = WebClient(view)
 

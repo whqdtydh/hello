@@ -1,6 +1,8 @@
 """检查 QtWebEngine 是否正常加载页面：轮询 URL 与 loadFinished 信号。"""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit
 from PySide6.QtWebEngineWidgets import QWebEngineView

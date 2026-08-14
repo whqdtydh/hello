@@ -1,6 +1,9 @@
 """诊断：dump 邮件详情页附件卡片的 outerHTML，确认能否直接读到下载链接。"""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -8,10 +11,15 @@ from app.engine.web_client import WebClient
 from app import config
 
 app = QApplication(sys.argv)
-win = QWidget(); win.setWindowTitle("诊断-附件DOM"); win.resize(1000, 680)
+win = QWidget()
+win.setWindowTitle("诊断-附件DOM")
+win.resize(1000, 680)
 lay = QVBoxLayout(win)
-view = QWebEngineView(); lay.addWidget(view, 4)
-log = QTextEdit(); log.setReadOnly(True); lay.addWidget(log, 1)
+view = QWebEngineView()
+lay.addWidget(view, 4)
+log = QTextEdit()
+log.setReadOnly(True)
+lay.addWidget(log, 1)
 
 web = WebClient(view)
 
@@ -48,9 +56,8 @@ def click_first_and_dump():
     ok = web.click_mail(0)
     log.append(f"click_mail(0) -> {ok}")
     web.wait_page_ready(timeout=30)
-    import time as _t
-    dl = _t.time() + 30
-    while _t.time() < dl:
+    dl = time.time() + 30
+    while time.time() < dl:
         if web.mail_detail_ready():
             log.append("详情已就绪")
             break

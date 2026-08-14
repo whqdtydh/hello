@@ -8,15 +8,6 @@ IMAP 邮箱文件夹名使用 modified UTF-7 编码：中文等非 ASCII 字符�
 
 import binascii
 
-_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-
-def _b64_char(c):
-    idx = _BASE64_ALPHABET.index(c)
-    if c == "+":
-        return ","  # modified UTF-7 用逗号代替加号
-    return c
-
 
 def encode(s):
     """把 unicode 字符串编码为 IMAP modified UTF-7。"""

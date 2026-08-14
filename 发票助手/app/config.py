@@ -1,17 +1,29 @@
-"""全局配置：路径、选择器、常量。选择器集中在此便于 QQ 邮箱改版后快速适配。"""
+"""全局配置：路径、选择器、常量。
 
+选择器集中在此便于 QQ 邮箱改版后快速适配。
+"""
+
+import json
 import os
+
+# 数据根目录（登录会话 / cookie / 凭据统一存放）
+DATA_DIR = os.path.join(os.path.expanduser("~"), ".invoice_assistant")
 
 # 系统 Edge 浏览器路径（复用本机浏览器，免下载 Playwright Chromium）
 EDGE_EXECUTABLE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
 # 邮箱登录会话 profile 保存目录（实现二次免登录）
-PROFILE_DIR = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "edge_profile")
+PROFILE_DIR = os.path.join(DATA_DIR, "edge_profile")
 
 # QtWebEngine 持久化目录（cookie / 缓存 / 本地存储）
-_PROFILE_BASE = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "webengine")
-PROFILE_CACHE_DIR = os.path.join(_PROFILE_BASE, "cache")
-PROFILE_STORAGE_DIR = os.path.join(_PROFILE_BASE, "storage")
+PROFILE_CACHE_DIR = os.path.join(DATA_DIR, "webengine", "cache")
+PROFILE_STORAGE_DIR = os.path.join(DATA_DIR, "webengine", "storage")
+
+# 手动持久化的 cookie 文件（requests 拉取附件时复用会话）
+COOKIE_FILE = os.path.join(DATA_DIR, "web_cookies.json")
+
+# IMAP 凭据持久化文件
+CRED_FILE = os.path.join(DATA_DIR, "imap_cred.json")
 
 # QQ 邮箱首页（登录入口 + 收件箱）
 MAIL_HOME = "https://wx.mail.qq.com/home/index"
@@ -44,17 +56,12 @@ INVOICE_FROM_KEYWORDS = ("itinerary", "fapiao")
 # 每封邮件仅下载这些后缀的附件（电子发票 PDF + 电子行程单 PDF）
 PDF_SUFFIX = ".pdf"
 
-# ---------- IMAP 凭据持久化 ----------
-import json
-
-_CRED_FILE = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "imap_cred.json")
-
 
 def save_imap_cred(account, auth_code):
     """保存 IMAP 账号与授权码到用户目录。"""
     try:
-        os.makedirs(os.path.dirname(_CRED_FILE), exist_ok=True)
-        with open(_CRED_FILE, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+        with open(CRED_FILE, "w", encoding="utf-8") as f:
             json.dump({"account": account, "auth_code": auth_code}, f, ensure_ascii=False)
         return True
     except Exception:
@@ -64,7 +71,7 @@ def save_imap_cred(account, auth_code):
 def load_imap_cred():
     """读取已保存的 IMAP 账号与授权码，没有则返回 ("", "")。"""
     try:
-        with open(_CRED_FILE, "r", encoding="utf-8") as f:
+        with open(CRED_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
         return d.get("account", ""), d.get("auth_code", "")
     except Exception:

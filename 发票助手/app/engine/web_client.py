@@ -7,6 +7,7 @@
 
 import json
 import os
+import re
 import time
 
 import requests
@@ -32,15 +33,24 @@ class AttachmentInterceptor(QWebEngineUrlRequestInterceptor):
 
     DOWNLOAD_HINTS = ("/attach/download", "attach/download", "disp=down", "file_download")
 
-    def __init__(self, urls: list):
+    def __init__(self, urls: list, req_urls: list = None):
         super().__init__()
         self._urls = urls
+        self._req_urls = req_urls if req_urls is not None else []
 
     def interceptRequest(self, info):
         url = info.requestUrl().toString().lower()
         if any(h in url for h in self.DOWNLOAD_HINTS):
             self._urls.append(info.requestUrl().toString())
             # 不 block：让浏览器继续发请求（保持会话一致），下载结果由 requests 拉取。
+        # 诊断：记录所有 mail.qq.com 域名的请求 URL（定位列表/详情接口）
+        if "mail.qq.com" in url and not any(s in url for s in
+                (".js", ".css", ".png", ".jpg", ".gif", ".woff", ".wasm", ".svg", "icon")):
+            full = info.requestUrl().toString()
+            if full not in self._req_urls:
+                self._req_urls.append(full)
+                if len(self._req_urls) > 500:
+                    del self._req_urls[:100]
 
 
 class WebClient(QObject):
@@ -61,8 +71,9 @@ class WebClient(QObject):
         self.profile.setPersistentStoragePath(config.PROFILE_STORAGE_DIR)
 
         self._sniffed_urls = []          # 拦截器捕获的下载 URL
+        self._req_urls = []              # 拦截器捕获的 QQ 接口请求 URL（诊断）
         self._download_items = {}        # 下载句柄队列
-        self._interceptor = AttachmentInterceptor(self._sniffed_urls)
+        self._interceptor = AttachmentInterceptor(self._sniffed_urls, self._req_urls)
         self.profile.setUrlRequestInterceptor(self._interceptor)
         self.profile.downloadRequested.connect(self._on_download_requested)
 
@@ -128,6 +139,48 @@ class WebClient(QObject):
     def current_url(self):
         return self.page.url().toString()
 
+    def page_info(self):
+        """底层诊断：直接读 Qt 层的 URL/title/加载状态（不走 JS，绕过 JS 失效场景）。"""
+        try:
+            return {
+                "url": self.page.url().toString(),
+                "title": self.page.title(),
+                "loading": self.page.isLoading(),
+                "view_visible": self.view.isVisible(),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def dump_page_html(self):
+        """诊断：把当前页面完整 HTML 写到 TEMP 文件，返回 (路径, 大小, 摘要)。
+        用于 JS 上下文失效时直接分析页面结构。"""
+        js = r"""
+(function(){
+  var h = document.documentElement ? document.documentElement.outerHTML : '';
+  var t = document.body ? (document.body.innerText||'').trim().replace(/\s+/g,' ').slice(0,200) : '';
+  // 详情页特征检测
+  var detail = {
+    has_attach: !!document.querySelector('.mail-detail-attach-card,[class*="attach-card"]'),
+    has_mail_body: !!document.querySelector('[class*="mail-detail"],[class*="mail-body"],[class*="detail-body"],[class*="mail-content"]'),
+    has_list: !!document.querySelector('div[class*=list-item]'),
+    hash: (location.hash||'').slice(0,80)
+  };
+  return {len: h.length, head: h.slice(0, 3000), body_text: t, url: (location.href||''), detail: detail};
+})()
+"""
+        try:
+            r = self.run_js_obj(js, timeout=15000)
+            if not r or not r.get("len"):
+                return {"ok": False, "reason": "JS 返回空（上下文失效）"}
+            p = os.path.join(os.environ.get("TEMP", "/tmp"), "invoice_page_dump.html")
+            with open(p, "w", encoding="utf-8", errors="replace") as f:
+                f.write(r.get("head", ""))
+            return {"ok": True, "path": p, "len": r.get("len"),
+                    "body_text": r.get("body_text", "")[:150],
+                    "detail": r.get("detail", {})}
+        except Exception as e:
+            return {"ok": False, "reason": str(e)[:80]}
+
     def wait_loaded(self, timeout=30000):
         deadline = time.time() + timeout / 1000
         while time.time() < deadline:
@@ -165,6 +218,48 @@ class WebClient(QObject):
             "(function(){var b=document.body;if(!b)return false;"
             "var t=b.innerText;return t.indexOf('收件箱')>=0;} )()",
             timeout=8000))
+
+    def get_sid(self):
+        """获取当前 QQ 邮箱会话 sid。
+
+        优先级：
+          1) cookie xm_sid
+          2) cookie sid
+          3) 当前页面 URL 的 sid= 参数（QQ 邮箱页面 URL 必带 sid）
+          4) 页面 JS 里常见变量（window.sid / location.href）
+        返回 sid 字符串；拿不到返回 ""。
+        注意：本方法访问 Qt 对象（current_url），须在 GUI 线程调用。
+        """
+        sid = ""
+        try:
+            sid = self.cookies.get_cookie_value("xm_sid") or ""
+        except Exception:
+            pass
+        if not sid:
+            try:
+                sid = self.cookies.get_cookie_value("sid") or ""
+            except Exception:
+                pass
+        if not sid:
+            try:
+                url = self.current_url()
+                m = re.search(r"[?&]sid=([^&#]+)", url)
+                if m:
+                    sid = m.group(1)
+            except Exception:
+                pass
+        if not sid:
+            try:
+                raw = self.run_js(
+                    "(function(){"
+                    "try{return window.sid||(location.href.match(/[?&]sid=([^&#]+)/)||[])[1]||'';}"
+                    "catch(e){return '';}})()",
+                    timeout=8000)
+                if raw and isinstance(raw, str):
+                    sid = raw.strip()
+            except Exception:
+                pass
+        return sid
 
     def wait_page_ready(self, timeout=120, need_inbox=False, on_status=None):
         """等待页面达到可用状态。
@@ -233,6 +328,7 @@ class WebClient(QObject):
   if(window.__invoiceTrackerInstalled)return;
   window.__invoiceTrackerInstalled=true;
   var KEY='invoice_selected';
+  var MIDMAP='invoice_msgid_map';
   function senderOf(item){
     var s=item.querySelector('.mail-sender,.mail-name,[class*=sender]');
     return s?(s.innerText||'').trim().slice(0,80):'';
@@ -251,6 +347,284 @@ class WebClient(QObject):
   function saveAll(o){
     try{localStorage.setItem(KEY, JSON.stringify(o));}catch(e){}
   }
+  // ---------- Message-ID 提取 ----------
+  function sniffMessageID(text){
+    if(!text) return '';
+    var m=text.match(/Message[\s\-]?ID\s*:\s*<([^>]{3,200})>/i);
+    if(m&&m[1]) return m[1];
+    m=text.match(/["']?(?:message[Ii][dD]|message_id|msgid|mid)["']?\s*[:=]\s*["']<([^"']{3,200})>["']/);
+    if(m&&m[1]) return m[1];
+    m=text.match(/["']?(?:message[Ii][dD]|message_id|msgid|mid)["']?\s*[:=]\s*["']([^"']{5,200})["']/);
+    if(m&&m[1]&&/@/.test(m[1])) return m[1];
+    return '';
+  }
+  function currentSid(){
+    var u=location.href;
+    var m=u.match(/[?&]sid=([^&#]+)/);
+    if(m&&m[1]) return decodeURIComponent(m[1]);
+    return '';
+  }
+  function midMap(){
+    try{return JSON.parse(localStorage.getItem(MIDMAP)||'{}');}catch(e){return {};}
+  }
+  var MDBG='invoice_msgid_dbg';
+  function mdbg(msg){
+    var arr=[];try{arr=JSON.parse(localStorage.getItem(MDBG)||'[]');}catch(e){}
+    arr.push('['+new Date().toTimeString().slice(0,8)+'] '+msg);
+    if(arr.length>100)arr=arr.slice(-100);
+    try{localStorage.setItem(MDBG,JSON.stringify(arr));}catch(e){}
+  }
+  function saveMid(mailid, mid){
+    if(!mid) return;
+    var mm=midMap();
+    mm[mailid]=mid;
+    try{localStorage.setItem(MIDMAP, JSON.stringify(mm));}catch(e){}
+  }
+  // 依次尝试 QQ 接口，返回 Message-ID 或 ''
+    function fetchRaw(mailid){
+    var sid=currentSid();
+    var enc=encodeURIComponent(mailid);
+    var urls=[
+      // 导出 eml：返回完整原始邮件（含 Message-ID）
+      'https://mail.qq.com/cgi-bin/readmail?t=readmail&mailid='+enc+'&mode=eml',
+      'https://mail.qq.com/cgi-bin/readmail?t=readmail&mailid='+enc+'&mode=text',
+      'https://mail.qq.com/cgi-bin/readmail?t=readmail&mailid='+enc,
+      'https://mail.qq.com/cgi-bin/readmail?sid='+sid+'&t=readmail&mailid='+enc+'&mode=text',
+      'https://wx.mail.qq.com/cgi-bin/readmail?t=readmail&mailid='+enc+'&mode=eml',
+      'https://wx.mail.qq.com/cgi-bin/readmail?t=readmail&mailid='+enc+'&mode=text',
+      'https://wx.mail.qq.com/cgi-bin/bizmail_showmail?t=showmail&mailid='+enc
+    ];
+    function tryFetch(i){
+      if(i>=urls.length) return Promise.resolve(null);
+      var name=urls[i].slice(0,80);
+      return fetch(urls[i], {credentials:'include', redirect:'follow'})
+        .then(function(r){
+          mdbg('接口 '+name+' HTTP '+r.status+' ct='+(r.headers.get('content-type')||'').slice(0,20));
+          return r.text();
+        })
+        .then(function(t){
+          var mid=sniffMessageID(t);
+          if(i===0){
+            try{localStorage.setItem('invoice_readmail_snip', (t||'').slice(0,500));}catch(e){}
+          }
+          mdbg('接口 '+name+' len='+t.length+' mid='+(mid||'无'));
+          if(mid) return {mid:mid};
+          return tryFetch(i+1);
+        })
+        .catch(function(e){mdbg('接口 '+name+' 错误: '+(e.message||e));return tryFetch(i+1);});
+    }
+    return tryFetch(0);
+  }
+  function grabMsgID(mailid){
+    if(midMap()[mailid]) return Promise.resolve(midMap()[mailid]);
+    return fetchRaw(mailid).then(function(res){
+      if(res&&res.mid){saveMid(mailid,res.mid);return res.mid;}
+      // 兜底：网络 hook 捕获的历史
+      try{
+        var net=JSON.parse(localStorage.getItem('invoice_msgids')||'{}');
+        var keys=Object.keys(net);
+        if(keys.length){saveMid(mailid,keys[0]);return keys[0];}
+      }catch(e){}
+      return '';
+    });
+  }
+  // 网络 hook：响应里直接找 Message-ID
+  function tryRecord(url, body){
+    if(!body) return;
+    // 诊断：记录所有 QQ 域名接口的 URL + 响应片段（不限路径，用于定位列表接口）
+    var u=(url||'');
+    if(/mail\.qq\.com|ex\.mail\.qq\.com|qiye\.mail\.qq\.com|qqmail|\.qq\.com/.test(u)
+       && !/\.(png|jpg|jpeg|gif|css|js|woff|svg|webp)/.test(u)){
+      var recs=[];
+      try{recs=JSON.parse(localStorage.getItem('invoice_net_dbg')||'[]');}catch(e){}
+      var head=(body||'').slice(0,80);
+      var line='GET '+u.slice(0,160)+' => len='+body.length
+               +' head='+JSON.stringify(head);
+      // 去重：同 URL 同长度只记一次，避免刷屏
+      if(recs.length===0 || recs[recs.length-1]!==line){
+        recs.push(line);
+        if(recs.length>400)recs=recs.slice(-400);
+        try{localStorage.setItem('invoice_net_dbg', JSON.stringify(recs));}catch(e){}
+      }
+      // 完整保存 list/maillist 响应（诊断加密格式）
+      if(/list\/maillist/.test(u) || /list\/top_maillist/.test(u)){
+        try{localStorage.setItem('invoice_maillist_raw', body.slice(0, 3000));}catch(e){}
+      }
+    }
+    var mid=sniffMessageID(body);
+    if(!mid) return;
+    try{
+      var map=JSON.parse(localStorage.getItem('invoice_msgids')||'{}');
+      map[mid]=mid;
+      localStorage.setItem('invoice_msgids', JSON.stringify(map));
+    }catch(e){}
+  }
+  var _fetch=window.fetch;
+  if(_fetch){
+    window.fetch=function(){
+      var args=arguments;
+      var url=typeof args[0]==='string'?args[0]:(args[0]&&args[0].url)||'';
+      return _fetch.apply(this,args).then(function(resp){
+        try{resp.clone().text().then(function(t){tryRecord(url,t);});}catch(e){}
+        return resp;
+      });
+    };
+  }
+  var _open=XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open=function(m,url){
+    this._url=url; return _open.apply(this,arguments);
+  };
+  var _send=XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send=function(){
+    var self=this;
+    this.addEventListener('readystatechange',function(){
+      if(self.readyState===4){
+        try{
+          tryRecord(self._url, self.responseText||'');
+          // 完整保存 maillist 响应
+          var u=(self._url||'');
+          if(/list\/maillist|list\/top_maillist/.test(u)){
+            try{localStorage.setItem('invoice_maillist_full', (self.responseText||'').slice(0,100000));}catch(e){}
+          }
+        }catch(e){}
+      }
+    });
+    return _send.apply(this,arguments);
+  };
+
+  // JSON.parse hook：拦截 QQ 解密后的明文 JSON（含邮件列表数据）
+  (function(){
+    var _jp = window.JSON.parse;
+    window.__invoiceInParse = window.__invoiceInParse || false;
+    window.JSON.parse = function(text){
+      var r;
+      try{ r = _jp(text); }catch(e){ throw e; }
+      if(window.__invoiceInParse){ return r; }  // 防重入（防无限递归）
+      window.__invoiceInParse = true;
+      try{
+        if(typeof text==='string' && text.length>200 &&
+           (/maillist/.test(text) || /fid/.test(text) || /sender/.test(text)
+            || /subject/.test(text) || text.indexOf('"data"')>=0)){
+          localStorage.setItem('invoice_json_hook', text.slice(0,100000));
+          // 独立保存 maillist 全文
+          if(/xmlistlogicsvr\/maillist/.test(text)){
+            localStorage.setItem('invoice_maillist_json', text.slice(0,200000));
+            // 追加保存，避免被覆盖
+            try{
+              var mls=[];
+              try{mls=_jp(localStorage.getItem('invoice_maillists')||'[]');}catch(e){}
+              mls.push(text.slice(0,200000));
+              if(mls.length>5)mls=mls.slice(-5);
+              localStorage.setItem('invoice_maillists', JSON.stringify(mls));
+            }catch(e){}
+            // ★ 关键：把 maillist 里的 emailid→messageid 写入 msgid 映射
+            try{
+              var _err='';
+              try{
+                var ml = _jp(text);
+                var bl = ml && ml.body;
+                var lst = bl && bl.list;
+                if(lst && lst.length){
+                  var midmap = {};
+                  try{ midmap = _jp(localStorage.getItem('invoice_msgid_map')||'{}'); }catch(e){ midmap={}; }
+                  var added = 0;
+                  for(var mi=0;mi<lst.length;mi++){
+                    var e0 = lst[mi];
+                    var eid = e0 && (e0.emailid || e0.mailid || e0.id || '');
+                    var emid = e0 && (e0.messageid || e0.messageId || '');
+                    if(eid && emid){
+                      if(!midmap[eid] || midmap[eid].length < emid.length){
+                        midmap[eid] = emid;
+                        added++;
+                      }
+                    }
+                  }
+                  if(added>0){
+                    localStorage.setItem('invoice_msgid_map', JSON.stringify(midmap));
+                    _err='OK +'+added+' 共'+(Object.keys(midmap).length||0);
+                  } else {
+                    _err='list len='+lst.length+' 但无(emailid,messageid)对';
+                  }
+                } else {
+                  _err='body.list 为空: body='+(typeof bl)+' list='+(typeof lst);
+                }
+              }catch(e){ _err='异常:'+e.message; }
+              try{
+                var md=[];
+                try{md=_jp(localStorage.getItem('invoice_msgid_map_log')||'[]');}catch(e){}
+                md.push('maillist 建映射: '+_err+' @'+new Date().toTimeString().slice(0,8));
+                if(md.length>30)md=md.slice(-30);
+                localStorage.setItem('invoice_msgid_map_log', JSON.stringify(md));
+              }catch(e){}
+            }catch(e){}
+          }
+          // 独立保存 mailid 为键的邮件详情对象（如 {"ZL...":{"mailid":...}}）
+          if(text.indexOf('"mailid"')>=0 && text.length<20000
+             && !/xmlistlogicsvr\/maillist/.test(text)
+             && text.indexOf('"head"')<0){
+            localStorage.setItem('invoice_mailobj_json', text.slice(0,20000));
+            // 追加保存，避免被覆盖
+            try{
+              var objs=[];
+              try{objs=_jp(localStorage.getItem('invoice_mailobjs')||'[]');}catch(e){}
+              objs.push(text.slice(0,5000));
+              if(objs.length>30)objs=objs.slice(-30);
+              localStorage.setItem('invoice_mailobjs', JSON.stringify(objs));
+            }catch(e){}
+          }
+          try{
+            var arr=[];
+            try{arr=_jp(localStorage.getItem('invoice_json_hook_list')||'[]');}catch(e){}
+            arr.push('len='+text.length+' head='+JSON.stringify(text.slice(0,120)));
+            if(arr.length>50)arr=arr.slice(-50);
+            localStorage.setItem('invoice_json_hook_list', JSON.stringify(arr));
+          }catch(e){}
+        }
+      }catch(e){}
+      window.__invoiceInParse = false;
+      return r;
+    };
+  })();
+
+  // WebSocket 钩子：QQ 新版列表可能走 WebSocket 推送
+  if(window.WebSocket){
+    var _WS=window.WebSocket;
+    window.WebSocket=function(url, protocols){
+      var ws = (typeof protocols==='undefined') ? new _WS(url) : new _WS(url, protocols);
+      var origAdd=ws.addEventListener;
+      ws.addEventListener=function(type, fn, opts){
+        if(type==='message'){
+          ws.addEventListener('message', function(ev){
+            try{
+              var data = ev.data||'';
+              var s = (typeof data==='string')?data:(data&&data.data)?String(data.data):'';
+              if(s && /mail|list|msg|json|sender|subject/i.test(s.slice(0,60))){
+                tryRecordWS(url, s);
+              }
+            }catch(e){}
+          });
+          return;
+        }
+        return origAdd.call(this, type, fn, opts);
+      };
+      return ws;
+    };
+    window.WebSocket.prototype=_WS.prototype;
+  }
+  function tryRecordWS(url, body){
+    if(!body) return;
+    try{
+      var recs=[];
+      try{recs=JSON.parse(localStorage.getItem('invoice_ws_dbg')||'[]');}catch(e){}
+      var line='WS '+url.slice(0,120)+' => len='+body.length+' head='+JSON.stringify(body.slice(0,120));
+      if(recs.length===0 || recs[recs.length-1]!==line){
+        recs.push(line);
+        if(recs.length>200)recs=recs.slice(-200);
+        localStorage.setItem('invoice_ws_dbg', JSON.stringify(recs));
+      }
+    }catch(e){}
+  }
+
   document.addEventListener('click', function(e){
     var t=e.target;
     var cb=t.closest?t.closest('.mail-checkbox,.xmail-ui-checkbox'):null;
@@ -258,7 +632,29 @@ class WebClient(QObject):
     var item=cb.closest?cb.closest('div[class*=list-item]'):null;
     if(!item)return;
     var mailid=item.getAttribute('data-mailid')||'';
+    // 探查：勾选那一刻该邮件项上所有属性 + HTML（诊断用）
+    try{
+      var attrs={}; for(var i=0;i<item.attributes.length;i++){var a=item.attributes[i];attrs[a.name]=a.value;}
+      var reactKey=item.getAttribute('_reactKey')||item.getAttribute('key')||'';
+      var vue=item.__vue__||(item.parentNode&&item.parentNode.__vue__)||null;
+      var probe={mailid:mailid,attrs:attrs,reactKey:reactKey,
+                 html:(item.outerHTML||'').slice(0,1500),
+                 vueData:vue?(JSON.stringify(vue.$attrs||{}).slice(0,400)):''};
+      localStorage.setItem('invoice_item_dump', JSON.stringify(probe));
+    }catch(err){}
     if(!mailid)return;
+    // 勾选时立即尝试提取 Message-ID（异步）
+    if(!midMap()[mailid]){
+      // 优先从 DOM 属性直接抓（xmmx 开头），失败再走 readmail 接口
+      var _dm='';
+      try{
+        var _a=['data-messageid','data-mid','data-msgid','data-message-id'];
+        for(var _i=0;_i<_a.length;_i++){var _v=item.getAttribute(_a[_i]);if(_v&&/xmmx/.test(_v)){_dm=_v;break;}}
+        if(!_dm){var _s=item.querySelector('[data-messageid],[data-mid],[data-msgid],[data-message-id]'); if(_s){_dm=_s.getAttribute('data-messageid')||_s.getAttribute('data-mid')||'';}}
+      }catch(e){}
+      if(_dm){saveMid(mailid,_dm);}
+      else{grabMsgID(mailid);}
+    }
     var all=readAll();
     if(all[mailid]){
       delete all[mailid];
@@ -282,22 +678,26 @@ class WebClient(QObject):
         script.setSourceCode(self.TRACKER_SCRIPT)
         self.profile.scripts().insert(script)
 
-    def get_selected_mails(self):
-        """返回勾选的邮件项列表，读取后自动取消所有勾选。
+    def get_selected_mails(self, keep_selection=True):
+        """返回勾选的邮件项列表。
 
         数据来源二合一：
           1) 注入到页面的监听脚本维护 localStorage['invoice_selected']（用户在
              DOM 中勾选/取消时实时记录，覆盖滚出视图的邮件）；
           2) 实时扫描当前 DOM 中处于勾选状态的邮件（兜底：脚本注入失败、
              勾选发生在脚本运行前的场景）。
-        两者按 mailid 合并去重。读取完成后【取消网页勾选 + 清空记录】，
-        保证「只下载本次勾选的邮件」——下次未勾选则不会重复下载。
+        两者按 mailid 合并去重。
+        keep_selection=True（默认）：读取后【保留网页勾选】，方便用户反复下载/
+        核对；False：读取后取消勾选（旧行为，只下载本次勾选）。
         返回列表元素结构：{mailid, sender, subject, time, fulltext, text}
         """
         js = r"""
 (function(){
   var KEY='invoice_selected';
+  var MIDMAP='invoice_msgid_map';
+  var KEEP=%s;
   function readAll(){try{return JSON.parse(localStorage.getItem(KEY)||'{}');}catch(e){return {};}}
+  function readMid(){try{return JSON.parse(localStorage.getItem(MIDMAP)||'{}');}catch(e){return {};}}
   function senderOf(item){
     var s=item.querySelector('.mail-sender,.mail-name,[class*=sender]');
     return s?(s.innerText||'').trim().slice(0,80):'';
@@ -310,40 +710,82 @@ class WebClient(QObject):
     var s=item.querySelector('[class*=time],[class*=date]');
     return s?(s.innerText||'').trim().slice(0,20):'';
   }
+  function trulyChecked(el){
+    // 严格判定：只有出现明确的「已勾选」图标/标记才算勾选，
+    // 避免 QQ 列表项的 active/current/selected/hover 类被误判。
+    if(el.querySelector('.ui-checkbox-icon-checked'))return true;
+    if(el.querySelector('[class*="checkbox"][class*="checked"]'))return true;
+    if(el.querySelector('[aria-checked="true"]'))return true;
+    if(/mail-item-checked/.test(el.className||''))return true;
+    return false;
+  }
+  function midOfItem(el){
+    // 从邮件项 DOM 直接找 QQ messageid：优先 data-* 属性，其次常见类名/文本
+    var attrs=['data-messageid','data-mid','data-msgid','data-message-id','data-id'];
+    for(var a=0;a<attrs.length;a++){
+      var v=el.getAttribute(attrs[a]);
+      if(v && /xmmx|message/i.test(v)) return v;
+    }
+    // 嵌套元素上的 data-* 
+    var subs=el.querySelectorAll('[data-messageid],[data-mid],[data-msgid],[data-message-id]');
+    for(var s=0;s<subs.length;s++){
+      var v2=subs[s].getAttribute('data-messageid')||subs[s].getAttribute('data-mid')
+              ||subs[s].getAttribute('data-msgid')||subs[s].getAttribute('data-message-id');
+      if(v2 && /xmmx/.test(v2)) return v2;
+    }
+    return '';
+  }
   var merged={};
   var items=document.querySelectorAll('div[class*=list-item]');
   var checkedEls=[];
+  var mids=readMid();
   for(var i=0;i<items.length;i++){
     var el=items[i];
-    var cls=el.className||'';
-    var cbIcon=el.querySelector('.ui-checkbox-icon-checked');
-    var checked=/mail-item-checked/.test(cls)||!!cbIcon
-      ||/sel|selected|current|active|checked/i.test(cls);
-    if(!checked)continue;
+    if(!trulyChecked(el))continue;
     var mailid=el.getAttribute('data-mailid')||'';
     if(!mailid)continue;
-    merged[mailid]={mailid:mailid,sender:senderOf(el),subject:subjOf(el),
-                    time:timeOf(el),fulltext:(el.innerText||'').slice(0,400)};
+    var rec={mailid:mailid,sender:senderOf(el),subject:subjOf(el),
+             time:timeOf(el),fulltext:(el.innerText||'').slice(0,400)};
+    if(mids[mailid])rec.message_id=mids[mailid];
+    else{
+      var dm=midOfItem(el);
+      if(dm)rec.message_id=dm;
+    }
+    merged[mailid]=rec;
     checkedEls.push(el);
   }
   var stored=readAll();
+  // 只采用 localStorage 中「当前 DOM 仍处于勾选状态」的记录，避免取消勾选后残留旧记录。
+  // 滚出视图的邮件（DOM 中无此项）无法核对，若之前勾选过则保留（用户主动勾选未取消）。
   for(var k in stored){
     var d=stored[k];
-    if(d&&d.mailid){merged[k]=d;}
+    if(!d||!d.mailid)continue;
+    var stillChecked=false;
+    for(var ii=0;ii<checkedEls.length;ii++){
+      if((checkedEls[ii].getAttribute('data-mailid')||'')===d.mailid){stillChecked=true;break;}
+    }
+    if(stillChecked){
+      if(!d.message_id&&mids[d.mailid])d.message_id=mids[d.mailid];
+      merged[k]=d;
+    }
+    // DOM 中已取消勾选 → 丢弃（不再下载）
   }
   var out=[];
   for(var k2 in merged){out.push(merged[k2]);}
-  // 取消网页上所有勾选（模拟点击勾选框，同步 QQ 内部状态）
-  var cbs=[];
-  for(var j=0;j<checkedEls.length;j++){
-    var cb=checkedEls[j].querySelector('.mail-checkbox,.xmail-ui-checkbox');
-    if(cb)cbs.push(cb);
-  }
-  for(var c=0;c<cbs.length;c++){try{cbs[c].click();}catch(e){}}
+  // 读取后清空 localStorage 勾选记录：DOM 是实时真相源，残留记录会导致「取消勾选后仍被下载」。
   try{localStorage.removeItem(KEY);}catch(e){}
+  // 默认保留网页勾选；仅当 KEEP=false 时取消勾选
+  if(!KEEP){
+    var cbs=[];
+    for(var j=0;j<checkedEls.length;j++){
+      var cb=checkedEls[j].querySelector('.mail-checkbox,.xmail-ui-checkbox');
+      if(cb)cbs.push(cb);
+    }
+    for(var c=0;c<cbs.length;c++){try{cbs[c].click();}catch(e){}}
+  }
   return JSON.stringify(out);
 })()
-"""
+""" % ("true" if keep_selection else "false")
         try:
             value = self.run_js_obj(js, timeout=15000)
         except Exception:
@@ -363,6 +805,8 @@ class WebClient(QObject):
                 "subject": subject,
                 "time": d.get("time", ""),
                 "fulltext": fulltext,
+                # 网页侧如能拿到 Message-ID 则透传（QQ DOM 通常没有，留空走哈希/关键词匹配）
+                "message_id": (d.get("message_id", "") or "").strip(),
                 # text 保持与旧 list_mails 一致的「全文」结构，
                 # IMAP 侧用它做哈希/关键词/发件人特征提取
                 "text": fulltext or (subject + " " + sender),
@@ -380,14 +824,47 @@ class WebClient(QObject):
             return None
 
     # ---------- 页面原子操作 ----------
-    def click_mail(self, index):
+    def _click_el(self, el_js):
+        """对指定 JS 表达式选中的元素模拟完整鼠标事件序列（mousedown→mouseup→click）。
+        QQ 邮箱 SPA 的点击处理可能绑定在 mousedown/mouseup 上，仅 .click() 不触发。"""
         js = (
             "(function(){"
-            "var els=document.querySelectorAll('div[class*=list-item]');"
-            "if(els.length<=%d)return false;"
-            "els[%d].click();return true;})()" % (index, index)
+            "var el=" + el_js + ";"
+            "if(!el)return false;"
+            "var r=el.getBoundingClientRect();"
+            "var opts={bubbles:true,cancelable:true,view:window,"
+            "clientX:r.left+r.width/2,clientY:r.top+r.height/2,button:0};"
+            "el.dispatchEvent(new MouseEvent('mousedown',opts));"
+            "el.dispatchEvent(new MouseEvent('mouseup',opts));"
+            "el.dispatchEvent(new MouseEvent('click',opts));"
+            "return true;})()"
         )
         return bool(self.run_js(js, timeout=15000))
+
+    def click_mail_by_id(self, mailid):
+        """按 QQ 内部唯一 mailid 打开邮件详情（列表排序变化也不受影响）。"""
+        el_js = (
+            "(function(){"
+            "var els=document.querySelectorAll('div[class*=list-item]');"
+            "for(var i=0;i<els.length;i++){"
+            "  if((els[i].getAttribute('data-mailid')||'')==='%s'){"
+            "    var t=els[i].querySelector('[class*=title],[class*=subject],[class*=summary],[class*=content],[class*=from]');"
+            "    return t||els[i];"
+            "  }"
+            "}"
+            "return null;})()" % mailid
+        )
+        return self._click_el(el_js)
+
+    def click_mail(self, index):
+        el_js = (
+            "(function(){"
+            "var els=document.querySelectorAll('div[class*=list-item]');"
+            "if(els.length<=%d)return null;"
+            "var t=els[%d].querySelector('[class*=title],[class*=subject],[class*=summary],[class*=content],[class*=from]');"
+            "return t||els[%d];})()" % (index, index, index)
+        )
+        return self._click_el(el_js)
 
     def mail_detail_ready(self):
         js = (
@@ -395,6 +872,206 @@ class WebClient(QObject):
             "return !!el;})()"
         )
         return bool(self.run_js(js, timeout=8000))
+
+    def probe_message_id(self):
+        """诊断：扫描当前页面（邮件详情）寻找 Message-ID，并把可疑片段写到磁盘。
+
+        返回 dict：{found: bool, candidates: [str]}。也把详情页 HTML 存到
+        `%TEMP%\\invoice_msgid_dump.html` 供人工分析。
+        """
+        js = r"""
+(function(){
+  var dump = document.body ? document.body.innerHTML : '';
+  var out = {found:false, candidates:[]};
+  var re = /Message[- ]?ID[^<]{0,200}/ig;
+  var m, c = [];
+  while((m = re.exec(dump))){ c.push(m[0].slice(0,120)); }
+  // 常见暴露点：页面上内联脚本里的 messageId / msgid / mid
+  var re2 = /[\"']?(?:messageId|msgid|mid)[\"']?\s*[:=]\s*[\"']([^\"']{8,80})[\"']/ig;
+  var m2, c2 = [];
+  while((m2 = re2.exec(dump))){ c2.push(m2[1]); }
+  c2.forEach(function(x){ if(c.indexOf(x)<0) c.push(x); });
+  out.candidates = c.slice(0,20);
+  out.found = c.length>0;
+  return {dump: dump.slice(0, 2000000), out: out};
+})()
+"""
+        try:
+            r = self.run_js_obj(js, timeout=15000)
+            if not r:
+                return {"found": False, "candidates": []}
+            dump = r.get("dump", "")
+            if dump:
+                p = os.path.join(os.environ.get("TEMP", "/tmp"), "invoice_msgid_dump.html")
+                try:
+                    with open(p, "w", encoding="utf-8", errors="replace") as f:
+                        f.write(dump)
+                except Exception:
+                    pass
+            return r.get("out", {"found": False, "candidates": []})
+        except Exception:
+            return {"found": False, "candidates": []}
+
+    def get_item_dump(self):
+        """诊断：读取最近一次勾选时保存的邮件项 HTML/属性/Vue data 转储。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_item_dump')||'';}"
+              "catch(e){return '';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            if not raw:
+                return None
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def get_captured_msgids(self):
+        """诊断：读取网络 hook 捕获到的 Message-ID 集合（dict）。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_msgids')||'{}';}"
+              "catch(e){return '{}';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def get_msgid_tampermonkey_dbg(self):
+        """诊断：读取油猴脚本的调试日志（localStorage['invoice_msgid_dbg']）。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_msgid_dbg')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def get_invoice_msgid_map(self):
+        """诊断：读取注入脚本提取的 mailid→Message-ID 映射（localStorage['invoice_msgid_map']）。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_msgid_map')||'{}';}"
+              "catch(e){return '{}';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def get_readmail_snippet(self):
+        """诊断：读取 readmail 接口响应首 500 字节。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_readmail_snip')||'';}"
+              "catch(e){return '';}})()")
+        try:
+            return self.run_js(js, timeout=8000) or ""
+        except Exception:
+            return ""
+
+    def get_msgid_map_log(self):
+        """诊断：读取 maillist→msgid 映射建立日志。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_msgid_map_log')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def get_net_dbg(self):
+        """诊断：读取网络钩子捕获的 QQ 邮件接口 URL+响应片段列表。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_net_dbg')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def get_ws_dbg(self):
+        """诊断：读取 WebSocket 钩子捕获的消息。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_ws_dbg')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def get_maillist_raw(self):
+        """诊断：读取 list/maillist 接口原始响应（加密前 3000 字节）。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_maillist_raw')||'';}"
+              "catch(e){return '';}})()")
+        try:
+            return self.run_js(js, timeout=8000) or ""
+        except Exception:
+            return ""
+
+    def get_json_hook(self):
+        """诊断：读取 JSON.parse hook 捕获的明文数据。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_json_hook')||'';}"
+              "catch(e){return '';}})()")
+        try:
+            return self.run_js(js, timeout=8000) or ""
+        except Exception:
+            return ""
+
+    def get_json_hook_list(self):
+        """诊断：读取 JSON.parse hook 捕获的数据摘要列表。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_json_hook_list')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def get_maillist_json(self):
+        """诊断：读取 maillist 完整明文 JSON。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_maillist_json')||'';}"
+              "catch(e){return '';}})()")
+        try:
+            return self.run_js(js, timeout=8000) or ""
+        except Exception:
+            return ""
+
+    def get_mailobj_json(self):
+        """诊断：读取 mailid 为键的邮件详情对象。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_mailobj_json')||'';}"
+              "catch(e){return '';}})()")
+        try:
+            return self.run_js(js, timeout=8000) or ""
+        except Exception:
+            return ""
+
+    def get_mailobjs(self):
+        """诊断：读取最近 30 个 mailid 键邮件详情对象。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_mailobjs')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def get_maillists(self):
+        """诊断：读取最近 5 个 maillist 完整明文 JSON。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_maillists')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
+
+    def get_req_urls(self):
+        """诊断：底层 URL 拦截器捕获的所有 mail.qq.com 接口请求。"""
+        return list(self._req_urls)
+
+    def get_captured_net(self):
+        """诊断：读取网络 hook 捕获的请求特征列表（url/len/flags）。"""
+        js = ("(function(){try{return localStorage.getItem('invoice_net')||'[]';}"
+              "catch(e){return '[]';}})()")
+        try:
+            raw = self.run_js(js, timeout=8000)
+            return json.loads(raw) if raw else []
+        except Exception:
+            return []
 
     def get_mail_date(self):
         js = (
@@ -498,6 +1175,111 @@ class WebClient(QObject):
                 return True
             self.qt_sleep(0.3)
         return False
+
+    def probe_detail_dom(self):
+        """诊断：探查当前邮件详情页的附件/下载元素结构（新旧版 DOM 兼容）。"""
+        js = r"""
+(function(){
+  var out = {url: (location.href||'').slice(0,160), attach_cards: 0, download_btns: 0,
+             samples: [], body_links: [], frames: [], body_head: '', frame_tree: []};
+  // 递归收集所有 frame 的 URL（含 iframe）
+  function collectFrames(w, depth){
+    var res = [];
+    if(!w || depth>4) return res;
+    try{
+      if(w.location && w.location.href){
+        res.push({d:depth, url:(w.location.href||'').slice(0,120),
+                  hasBody: !!(w.document && w.document.body && w.document.body.children.length)});
+      }
+      for(var i=0; i<w.frames.length; i++){
+        try{ res = res.concat(collectFrames(w.frames[i], depth+1)); }catch(e){}
+      }
+    }catch(e){
+      res.push({d:depth, err:String(e).slice(0,40)});
+    }
+    return res;
+  }
+  try{ out.frame_tree = collectFrames(window, 0); }catch(e){ out.frame_tree=[{err:String(e).slice(0,60)}]; }
+  // 附件卡片：多种可能的类名/结构
+  var cards = document.querySelectorAll(
+    '.mail-detail-attach-card,[class*="attach-card"],[class*="attachment"],[class*="file-card"],[class*="enclosure"]');
+  out.attach_cards = cards.length;
+  for(var i=0;i<Math.min(cards.length,5);i++){
+    var c = cards[i];
+    out.samples.push({
+      cls: (c.className||'').slice(0,80),
+      text: (c.innerText||'').slice(0,80),
+      html: (c.outerHTML||'').slice(0,300)
+    });
+  }
+  // iframe 探查（QQ 新版详情可能在 iframe 里）
+  var ifs = document.querySelectorAll('iframe');
+  out.frames = [];
+  for(var fi=0; fi<ifs.length; fi++){
+    out.frames.push({src:(ifs[fi].src||'').slice(0,120), id: ifs[fi].id||'', cls:(ifs[fi].className||'').slice(0,40)});
+  }
+  // 整个文档里的下载/附件关键词容器（不限类名）
+  var kwEls = [];
+  var all = document.querySelectorAll('div,span,a,button');
+  for(var ai=0; ai<all.length; ai++){
+    var t = (all[ai].innerText||'').trim();
+    if((t==='下载' || t==='保存到云盘') && all[ai].children.length===0){
+      kwEls.push({tag:all[ai].tagName, cls:(all[ai].className||'').slice(0,60), text:t});
+    }
+  }
+  out.download_words = kwEls;
+  // 下载按钮/链接
+  var btns = document.querySelectorAll(
+    '.xmail-ui-btn,[class*="download"],[class*="btn-download"],[class*="operate-btn"]');
+  out.download_btns = btns.length;
+  // 附件卡片内的按钮（精确探查下载按钮类名）
+  var cardBtns = [];
+  for(var ci=0; ci<Math.min(cards.length,4); ci++){
+    var cb = cards[ci].querySelectorAll('*');
+    var info = [];
+    for(var bi=0; bi<cb.length; bi++){
+      var el = cb[bi];
+      var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+      var cursor = style ? style.cursor : '';
+      var clickable = cursor==='pointer' || el.onclick || el.getAttribute('role')==='button'
+                      || el.getAttribute('data-click') || el.getAttribute('data-action')
+                      || el.getAttribute('data-role');
+      if(!clickable) continue;
+      info.push({tag: el.tagName, cls: (el.className||'').slice(0,60),
+                 text: (el.innerText||'').trim().slice(0,20),
+                 cursor: cursor, role: el.getAttribute('role')||'',
+                 data: (el.getAttribute('data-action')||el.getAttribute('data-click')||el.getAttribute('data-role')||'').slice(0,40),
+                 title: (el.getAttribute('title')||'').slice(0,30),
+                 aria: (el.getAttribute('aria-label')||el.getAttribute('aria-label')||'').slice(0,30)});
+    }
+    cardBtns.push(info);
+  }
+  out.card_buttons = cardBtns;
+  // 卡片完整 HTML（含按钮图标结构，用于识别下载按钮）
+  var cardHtmls = [];
+  for(var hi=0; hi<Math.min(cards.length,3); hi++){
+    cardHtmls.push((cards[hi].outerHTML||'').slice(0,1200));
+  }
+  out.card_htmls = cardHtmls;
+  // 正文直链（51fapiao/alipay 等 PDF 链接）
+  var aTags = document.querySelectorAll('a[href]');
+  for(var j=0;j<aTags.length;j++){
+    var h = aTags[j].href||'';
+    if(/\.pdf|dlj\.|alipayobjects|51fapiao|fapiao/i.test(h)){
+      out.body_links.push({text:(aTags[j].innerText||'').slice(0,40), href:h.slice(0,160)});
+    }
+  }
+  // 正文文本前 120 字（判断当前打开的邮件内容）
+  var bt = (document.body && document.body.innerText || '').trim().replace(/\s+/g,' ').slice(0,150);
+  out.body_head = bt;
+  return out;
+})()
+"""
+        try:
+            r = self.run_js_obj(js, timeout=15000)
+            return r or {}
+        except Exception:
+            return {}
 
     def consume_download_url(self, timeout=8):
         """返回嗅探到的下载 URL 列表（含先前捕获），并清空当前等待队列。"""

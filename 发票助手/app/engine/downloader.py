@@ -70,6 +70,7 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None):
 
     其余类型（酒店发票/餐饮发票/机票发票等）直接沿用 kind 作为标签。
     rw（铁路信息 dict）非空时使用乘车日期/发到站/票价生成高铁文件名。
+    规则：所有文件命名必须标注价格；提取不到金额时标注 0.00。
     """
     company, amount = parse_original_name(display_name)
     if "高铁" in kind:
@@ -78,7 +79,7 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None):
             date_part = _month_date_label(rw.get("issue_date") or rw.get("date") or date_str)
             route = rw.get("route", "")
             amt = rw.get("amount") or 0.0
-            parts = [p for p in [date_part, "高铁", route, f"{amt:.2f}" if amt else ""] if p]
+            parts = [p for p in [date_part, "高铁", route, f"{amt:.2f}"] if p]
             if parts:
                 return "_".join(parts) + ".pdf"
         label = "高铁发票"
@@ -96,8 +97,8 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None):
         except Exception:
             pass
     parts = [date_label(date_str), label]
-    if amount:
-        parts.append(amount)
+    # 强制标注价格：提取不到则 0.00
+    parts.append(amount if amount else "0.00")
     return "_".join(p for p in parts if p) + ".pdf"
 
 
@@ -131,105 +132,132 @@ class DownloadController:
 
     # ---------- 主流程 ----------
     def run(self, selected_mails):
-        """selected_mails: 用户勾选的邮件 [{index, text}]"""
-        os.makedirs(self.save_dir, exist_ok=True)
+        """selected_mails: 用户勾选的邮件 [{index, text}]
 
+        说明：所有 self.client.* 方法都在操作 QtWebEngine，必须运行在 GUI 线程。
+        run() 适合由主线程驱动；若需在后台线程调用请改用 prepare()+process_next()，
+        由主线程的 QTimer 逐封推进（见 main_window）。"""
+        os.makedirs(self.save_dir, exist_ok=True)
         if not selected_mails:
             self.log("没有检测到勾选的邮件。请先在左侧网页中勾选需要下载的邮件。")
             return []
-
-        total = len(selected_mails)
-        self.log(f"检测到勾选 {total} 封邮件，开始处理…")
-        processed = 0
-
-        for m in selected_mails:
-            if self.stop_flag:
-                self.log("已手动停止。")
-                break
-            idx = m["index"]
-            text = m.get("text", "")
-
-            if not is_invoice_mail(text):
-                self.log(f"⏭ 跳过非发票邮件: {text[:30]}")
-                continue
-
-            self.log(f"▶ 打开发票邮件: {text[:40]}…")
-            if not self.client.click_mail(idx):
-                self.log("    打开失败")
-                continue
-            self._wait_detail_ready()
-
-            date_str = normalize_date(self.client.get_mail_date())
-            attachments = self.client.get_attachments()
-            n_pdf = 0
-
-            # 批量嗅探：先为所有 PDF 附件规划目标路径并逐个点击下载按钮
-            # （不等待），然后统一收集拦截器捕获的 URL，再并行拉取。
-            tasks = []  # [(dest, url)]
-            clicked_cards = []  # 已成功点击的附件卡片索引（顺序）
-
-            for c, att in enumerate(attachments):
-                if self.stop_flag:
-                    break
-                name = att.get("name", "")
-                suffix = att.get("suffix", "").strip().lower()
-                display = att.get("suffix", "").strip()
-                size = att.get("size", "").strip()
-
-                if suffix != config.PDF_SUFFIX:
-                    self.log(f"    ⏭ 跳过非PDF {name}{display} ({size})")
-                    continue
-
-                kind = "电子行程单" if "行程单" in (name + display) else "电子发票"
-                fname = build_filename(kind, name, date_str)
-                dest = unique_path(self.save_dir, fname)
-                tasks.append((dest, None))
-
-                if self.client.click_download(c):
-                    clicked_cards.append(c)
-                else:
-                    self.log(f"    ✗ 无法触发下载 {name}{display}")
-
-            # 统一收集：点击后拦截器立即捕获，通常很快
-            if clicked_cards:
-                self.client.qt_sleep(0.3)
-                pending_urls = self.client.consume_download_url(timeout=3.0)
-                for i in range(min(len(tasks), len(pending_urls))):
-                    tasks[i] = (tasks[i][0], pending_urls[i])
-                for dest, url in tasks:
-                    if not url:
-                        self.log(f"    ✗ 未嗅探到下载URL {os.path.basename(dest)}")
-
-            # 并行拉取所有已嗅探到 URL 的下载
-            urls_to_fetch = [(dest, url) for dest, url in tasks if url]
-            if urls_to_fetch:
-                with ThreadPoolExecutor(max_workers=4) as pool:
-                    futures = {}
-                    for dest, url in urls_to_fetch:
-                        self.log(f"    ↓ 拉取 {os.path.basename(dest)}")
-                        futures[pool.submit(self.client.fetch_url, url, dest)] = dest
-                    for fut in futures:
-                        dest = futures[fut]
-                        try:
-                            fut.result()
-                            if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                                self.report_downloaded(dest)
-                                n_pdf += 1
-                            else:
-                                self.log(f"    ✗ 拉取结果为空 {os.path.basename(dest)}")
-                        except Exception as e:
-                            self.log(f"    ✗ 拉取失败 {os.path.basename(dest)}: {str(e)[:60]}")
-
-            processed += 1
-            self.log(f"    本邮件完成（PDF {n_pdf} 个）")
-            self.on_progress(processed, total, self.downloaded_pdf_count)
-
-            if not self.client.back_to_list():
-                self.log("    返回列表失败（将尝试重新加载）")
-            self.client.qt_sleep(0.3)
-
+        self.prepare(selected_mails)
+        while self.process_next():
+            pass
         self.log(f"🏁 全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
         return self.downloaded_files
+
+    def prepare(self, selected_mails):
+        """初始化处理队列。必须在 GUI 线程调用。"""
+        os.makedirs(self.save_dir, exist_ok=True)
+        self._mails = selected_mails
+        self._i = 0
+        self._total = len(selected_mails)
+        self.log(f"检测到勾选 {self._total} 封邮件，开始处理…")
+
+    def process_next(self):
+        """在 GUI 线程处理下一封邮件。返回 True 表示还有更多待处理。"""
+        if self.stop_flag:
+            self.log("已手动停止。")
+            return False
+        if self._i >= self._total:
+            return False
+        i = self._i
+        m = self._mails[i]
+        self._i += 1
+        self._process_one(m, i)
+        return self._i < self._total
+
+    def _process_one(self, m, processed):
+        """处理单封邮件（打开 -> 读附件 -> 触发下载 -> 拉取）。"""
+        idx = m.get("index")
+        mailid = m.get("mailid", "")
+        text = m.get("text", "")
+
+        if not is_invoice_mail(text):
+            self.log(f"⏭ 跳过非发票邮件: {text[:30]}")
+            return
+
+        self.log(f"▶ 打开发票邮件: {text[:40]}…")
+        ok = False
+        if mailid:
+            ok = self.client.click_mail_by_id(mailid)
+            if not ok:
+                self.log(f"    未按 mailid 找到，退回按索引: {mailid[:24]}")
+        if not ok and idx is not None:
+            ok = self.client.click_mail(idx)
+        if not ok:
+            self.log("    打开失败")
+            return
+        self._wait_detail_ready()
+
+        date_str = normalize_date(self.client.get_mail_date())
+        attachments = self.client.get_attachments()
+        n_pdf = 0
+
+        # 批量嗅探：先为所有 PDF 附件规划目标路径并逐个点击下载按钮
+        # （不等待），然后统一收集拦截器捕获的 URL，再并行拉取。
+        tasks = []  # [(dest, url)]
+        clicked_cards = []  # 已成功点击的附件卡片索引（顺序）
+
+        for c, att in enumerate(attachments):
+            if self.stop_flag:
+                break
+            name = att.get("name", "")
+            suffix = att.get("suffix", "").strip().lower()
+            display = att.get("suffix", "").strip()
+            size = att.get("size", "").strip()
+
+            if suffix != config.PDF_SUFFIX:
+                self.log(f"    ⏭ 跳过非PDF {name}{display} ({size})")
+                continue
+
+            kind = "电子行程单" if "行程单" in (name + display) else "电子发票"
+            fname = build_filename(kind, name, date_str)
+            dest = unique_path(self.save_dir, fname)
+            tasks.append((dest, None))
+
+            if self.client.click_download(c):
+                clicked_cards.append(c)
+            else:
+                self.log(f"    ✗ 无法触发下载 {name}{display}")
+
+        # 统一收集：点击后拦截器立即捕获，通常很快
+        if clicked_cards:
+            self.client.qt_sleep(0.3)
+            pending_urls = self.client.consume_download_url(timeout=3.0)
+            for i in range(min(len(tasks), len(pending_urls))):
+                tasks[i] = (tasks[i][0], pending_urls[i])
+            for dest, url in tasks:
+                if not url:
+                    self.log(f"    ✗ 未嗅探到下载URL {os.path.basename(dest)}")
+
+        # 并行拉取所有已嗅探到 URL 的下载
+        urls_to_fetch = [(dest, url) for dest, url in tasks if url]
+        if urls_to_fetch:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {}
+                for dest, url in urls_to_fetch:
+                    self.log(f"    ↓ 拉取 {os.path.basename(dest)}")
+                    futures[pool.submit(self.client.fetch_url, url, dest)] = dest
+                for fut in futures:
+                    dest = futures[fut]
+                    try:
+                        fut.result()
+                        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+                            self.report_downloaded(dest)
+                            n_pdf += 1
+                        else:
+                            self.log(f"    ✗ 拉取结果为空 {os.path.basename(dest)}")
+                    except Exception as e:
+                        self.log(f"    ✗ 拉取失败 {os.path.basename(dest)}: {str(e)[:60]}")
+
+        self.log(f"    本邮件完成（PDF {n_pdf} 个）")
+        self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+
+        if not self.client.back_to_list():
+            self.log("    返回列表失败（将尝试重新加载）")
+        self.client.qt_sleep(0.3)
 
     def report_downloaded(self, path):
         if path and path not in self.downloaded_files:

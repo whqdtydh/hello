@@ -1,0 +1,114 @@
+[
+  {
+    "kind": "电子行程单",
+    "subject": ["行程单"],
+    "attachment": ["行程单"],
+    "body": ["行程单"],
+    "regex": false,
+    "priority": 100
+  },
+  {
+    "kind": "高铁发票",
+    "subject": ["高铁", "12306", "网上购票"],
+    "attachment": ["高铁", "行程单"],
+    "body": ["车次", "上海虹桥-杭州东"],
+    "regex": false,
+    "priority": 90
+  },
+  {
+    "kind": "高速发票",
+    "subject": ["通行费"],
+    "attachment": [],
+    "body": ["通行费"],
+    "regex": false,
+    "priority": 80
+  },
+  {
+    "kind": "打车发票",
+    "subject": ["打车", "滴滴", "出租车"],
+    "attachment": ["打车", "滴滴"],
+    "body": ["计费", "元"],
+    "regex": false,
+    "priority": 70
+  },
+  {
+    "kind": "酒店发票",
+    "subject": ["酒店", "住宿"],
+    "attachment": ["酒店", "住宿"],
+    "body": ["房费", "住宿费"],
+    "regex": false,
+    "priority": 60
+  },
+  {
+    "kind": "餐饮发票",
+    "subject": ["餐饮", "消费", "外卖"],
+    "attachment": ["餐饮", "消费"],
+    "body": ["餐饮", "消费", "元"],
+    "regex": false,
+    "priority": 50
+  },
+  {
+    "kind": "停车发票",
+    "subject": ["停车"],
+    "attachment": [],
+    "body": ["停车"],
+    "regex": false,
+    "priority": 40
+  },
+  {
+    "kind": "加油发票",
+    "subject": ["加油"],
+    "attachment": [],
+    "body": ["加油", "升"],
+    "regex": false,
+    "priority": 30
+  },
+  {
+    "kind": "购物发票",
+    "subject": ["超市", "商城", "购物"],
+    "attachment": [],
+    "body": ["购物", "百货"],
+    "regex": false,
+    "priority": 20
+  },
+  {
+    "kind": "机票发票",
+    "subject": ["机票", "航空"],
+    "attachment": [],
+    "body": ["机票", "航班"],
+    "regex": false,
+    "priority": 15
+  },
+  {
+    "kind": "快递发票",
+    "subject": ["快递", "物流"],
+    "attachment": [],
+    "body": ["快递", "物流"],
+    "regex": false,
+    "priority": 12
+  },
+  {
+    "kind": "通讯发票",
+    "subject": ["话费", "通讯"],
+    "attachment": [],
+    "body": ["话费", "通讯"],
+    "regex": false,
+    "priority": 10
+  },
+  {
+    "kind": "水电发票",
+    "subject": ["水费", "电费", "燃气"],
+    "attachment": [],
+    "body": ["水费", "电费", "燃气"],
+    "regex": false,
+    "priority": 5
+  },
+  {
+    "kind": "电子发票",
+    "subject": [],
+    "attachment": [],
+    "body": [],
+    "regex": false,
+    "priority": 1
+  }
+]

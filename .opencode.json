@@ -1,4 +1,6 @@
 {
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [".opencode/zh-output.md"],
   "mcpServers": {
     "cloudbase": {
       "command": "npx",

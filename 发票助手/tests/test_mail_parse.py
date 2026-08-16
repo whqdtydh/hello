@@ -207,3 +207,33 @@ class TestAlipayFilename:
 
     def test_default(self):
         assert mail_parse.alipay_filename("https://x.com/noext", "d.pdf") == "d.pdf"
+
+
+class TestConsumeDate:
+    def test_行程时间(self):
+        assert mail_parse.consume_date(
+            "行程时间：2026-07-30 11:28 至 2026-07-30 11:44") == "2026-07-30"
+
+    def test_通行时间(self):
+        assert mail_parse.consume_date(
+            "通行时间：2026-08-13 10:28 - 2026-08-13 10:54") == "2026-08-13"
+
+    def test_消费日期标签(self):
+        assert mail_parse.consume_date(
+            "消费日期：2026年8月11日") == "2026-08-11"
+
+    def test_无标签年月日(self):
+        assert mail_parse.consume_date(
+            "开票日期：2026年8月13日") == "2026-08-13"
+
+    def test_点分日期(self):
+        assert mail_parse.consume_date("行程日期：2026.08.04") == "2026-08-04"
+
+    def test_空(self):
+        assert mail_parse.consume_date("") == ""
+        assert mail_parse.consume_date("尊敬的高德用户，感谢您使用打车服务") == ""
+
+    def test_带标签优先于开票日期(self):
+        # 既有消费日期又有开票日期，应取带标签的消费日期
+        text = "行程时间：2026-07-30 11:28\n开票日期：2026年8月4日"
+        assert mail_parse.consume_date(text) == "2026-07-30"

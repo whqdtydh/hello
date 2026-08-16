@@ -60,11 +60,11 @@ class TestBuildFilename:
 
     def test_itinerary(self):
         name = build_filename("行程单", "行程单.pdf", "2026-08-11")
-        assert name == "8.11号_行程单.pdf"
+        assert name == "8.11号_行程单_0.00.pdf"
 
     def test_kind_label(self):
         name = build_filename("酒店发票", "酒店.pdf", "2026-08-11")
-        assert name == "8.11号_酒店发票.pdf"
+        assert name == "8.11号_酒店发票_0.00.pdf"
 
     def test_railway(self):
         rw = {"issue_date": "2026-08-11", "date": "2026-08-09",
@@ -74,7 +74,7 @@ class TestBuildFilename:
 
     def test_railway_no_rw(self):
         name = build_filename("高铁发票", "高铁.pdf", "2026-08-11")
-        assert name == "8.11号_高铁发票.pdf"
+        assert name == "8.11号_高铁发票_0.00.pdf"
 
 
 class TestUniquePath:

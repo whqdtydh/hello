@@ -69,10 +69,40 @@ def save_imap_cred(account, auth_code):
 
 
 def load_imap_cred():
-    """读取已保存的 IMAP 账号与授权码，没有则返回 ("", "")。"""
+    """读取已保存的 IMAP 账号与授权码，没有则返回 ("", "")."""
     try:
         with open(CRED_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
         return d.get("account", ""), d.get("auth_code", "")
     except Exception:
         return "", ""
+
+# ---------------------------------------------------------------------------
+# 规则与 LLM 辅助配置（可在部署时自行修改）
+# ---------------------------------------------------------------------------
+# 规则文件路径（JSON）
+RULES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "invoice_rules.json")
+# 是否启用 LLM（MIMO v2.5 free）建议功能，默认关闭（防止意外网络调用）
+ENABLE_LLM_SUGGESTION = True
+
+# 日志记录（使用标准库 logging，外部可自行配置日志输出）
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG_UNMATCHED = logging.getLogger("unmatched")
+LOG_LLM_SUGGESTION = logging.getLogger("llm_suggestion")
+LOG_ERROR = logging.getLogger("error")
+
+# 加载规则（在首次使用时调用）
+def load_invoice_rules():
+    """读取 `invoice_rules.json` 并返回规则列表。
+    若文件不存在或解析错误，返回空列表并记录错误。"""
+    try:
+        with open(RULES_FILE, "r", encoding="utf-8") as f:
+            rules = json.load(f)
+        return rules
+    except Exception as e:
+        LOG_ERROR.error(f"加载发票规则失败: {e}")
+        return []
+
+# 预先加载到全局变量，供整个进程使用
+INVOICE_RULES = load_invoice_rules()

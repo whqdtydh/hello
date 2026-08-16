@@ -106,6 +106,18 @@ class CookieStore(QObject):
             pass
 
     # ---------- 提供给 requests ----------
+    def get_cookie_value(self, name, host=None):
+        """按 cookie 名取值（如 xm_sid）。host 可选，用于限定域名。"""
+        with self._lock:
+            items = list(self._cookies.items())
+        for (domain, n), c in items:
+            if n != name:
+                continue
+            if host and host not in domain:
+                continue
+            return self._to_str(c.value())
+        return ""
+
     def get_cookie_jar(self, url):
         """从已收集的 cookie 中按域名过滤，返回 requests CookieJar。
 

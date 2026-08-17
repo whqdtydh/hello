@@ -12,6 +12,7 @@ from app.engine.api_downloader import (
     extract_alipay_links,
     extract_amount_from_text,
     extract_invoice_no,
+    extract_oss_links,
     failed_folder_name,
     is_invoice_mail,
     parse_original_name,
@@ -60,8 +61,15 @@ class TestBuildFilename:
         assert name == "8.11号_酒店发票_0.00.pdf"
 
     def test_railway(self):
+        # 高铁发票用乘车日期 date（消费日期）命名，优先于开票日期 issue_date
         rw = {"issue_date": "2026-08-11", "date": "2026-08-09",
               "route": "上海虹桥-杭州东", "amount": 87.0}
+        name = build_filename("高铁发票", "高铁.pdf", "2026-08-11", rw=rw)
+        assert name == "8月9_高铁_上海虹桥-杭州东_87.00.pdf"
+
+    def test_railway_no_date(self):
+        # 只有开票日期时退回 issue_date
+        rw = {"issue_date": "2026-08-11", "date": "", "route": "上海虹桥-杭州东", "amount": 87.0}
         name = build_filename("高铁发票", "高铁.pdf", "2026-08-11", rw=rw)
         assert name == "8月11_高铁_上海虹桥-杭州东_87.00.pdf"
 
@@ -127,9 +135,31 @@ class TestLinkExtraction:
         assert len(links) == 1
         assert ".pdf" in links[0]
 
+    def test_oss(self):
+        # 淘宝闪购商家发票：阿里云 OSS jpg，带签名参数
+        content = ('<a class="link" href="https://fin-invoice-zbprod-zb1-oss-1.'
+                   'oss-cn-zhangjiakou.aliyuncs.com/cInvoice/manualInvoice/'
+                   'manualInvoiceForC-c97cc4a0-7d25-4b2f-bacf-43223d30efd8.jpg'
+                   '?Expires=3357946163&OSSAccessKeyId=LTAIsLzAMnljb8cj'
+                   '&Signature=m9N2VRJOgOwG2fHkwXe5r40pfn4%3D">查看电子发票文件</a>')
+        links = extract_oss_links(content)
+        assert len(links) == 1
+        assert "oss-cn-zhangjiakou.aliyuncs.com" in links[0]
+        assert links[0].endswith("pfn4%3D")
+
+    def test_oss_html_entity(self):
+        # &amp; 实体转义也应还原提取
+        content = ('<a href="https://fin-invoice-zbprod-zb1-oss-1.'
+                   'oss-cn-hangzhou.aliyuncs.com/cInvoice/x/a.png?Expires=1'
+                   '&amp;OSSAccessKeyId=K&amp;Signature=S">x</a>')
+        links = extract_oss_links(content)
+        assert len(links) == 1
+        assert "Expires=1&OSSAccessKeyId=K&Signature=S" in links[0]
+
     def test_empty(self):
         assert extract_51fapiao_links("") == []
         assert extract_alipay_links("") == []
+        assert extract_oss_links("") == []
 
 
 class TestInvoiceNo:
@@ -260,9 +290,9 @@ class TestInvoiceKindNaming:
         # 高速费
         kind2 = invoice_kind(subj="浙江通行费电子发票", att_name="21.00元.zip", body="")
         assert kind2 == "高速发票"
-        # 华铁 → 高铁发票
+        # 华铁（高铁餐车餐饮服务商）→ 餐饮发票
         kind3 = invoice_kind(subj="【上海华铁旅客服务有限公司】价税合计金额为33.00的电子发票", att_name="", body="")
-        assert kind3 == "高铁发票"
+        assert kind3 == "餐饮发票"
 
     def test_51fapiao_wbr_extract(self):
         # QQ 邮箱正文长链接被 <wbr> 拆断 → 应恢复完整 36 位 id
@@ -273,14 +303,14 @@ class TestInvoiceKindNaming:
         assert "b367c2264" in links[0]
 
     def test_huatie_naming(self):
-        # 华铁：分类为高铁发票，命名带价格
+        # 华铁（高铁餐车餐饮）→ 餐饮发票，命名带价格
         subj = ("【电子发票】您收到一张来自【上海华铁旅客服务有限公司】"
                 "价税合计金额为33.00的电子发票[购方名称:小核智能机器人（杭州）有限公司 发票号码:11901140]")
         from app.engine.mail_parse import invoice_kind
         kind = invoice_kind(subj=subj)
-        assert kind == "高铁发票"
+        assert kind == "餐饮发票"
         name = build_filename(kind, subj, "2026-08-06", msg="")
-        assert name == "8.6号_高铁发票_33.00.pdf", name
+        assert name == "8.6号_餐饮发票_33.00.pdf", name
 
 
 class TestRenameDirWithAmount:

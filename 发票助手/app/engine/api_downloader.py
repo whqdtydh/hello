@@ -22,7 +22,7 @@ import requests
 from app import config
 from app.engine.acl_util import grant_current_user_access
 from app.engine.api_registry import ApiRegistry
-from app.engine.mail_parse import invoice_kind, ticket_amount, consume_date
+from app.engine.mail_parse import invoice_kind, ticket_amount, consume_date, kind_from_pdf
 from app.engine.web_client import WebClient
 
 
@@ -43,6 +43,17 @@ def date_label(date_str):
     try:
         parts = date_str.split("-")
         return f"{int(parts[1])}.{int(parts[2])}号"
+    except Exception:
+        return ""
+
+
+def _cn_date_to_iso(cn):
+    """把 2026年08月06日 转为 2026-08-06，失败返回空串。"""
+    try:
+        m = re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", cn or "")
+        if not m:
+            return ""
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     except Exception:
         return ""
 
@@ -78,7 +89,7 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None):
     company, amount = parse_original_name(display_name)
     if "高铁" in kind:
         if rw:
-            date_part = _month_date_label(rw.get("issue_date") or rw.get("date") or date_str)
+            date_part = _month_date_label(rw.get("date") or rw.get("issue_date") or date_str)
             route = rw.get("route", "")
             amt = rw.get("amount") or 0.0
             parts = [p for p in [date_part, "高铁", route, f"{amt:.2f}"] if p]
@@ -165,7 +176,9 @@ def extract_amount_from_text(text):
         return 0.0
     val = next((g for g in m.groups() if g), "")
     try:
-        return float(val)
+        v = float(val)
+        # 金额上限保护：订单号/发票号等长数字（如 26339190041008832512）误入时归 0
+        return v if 0 < v < 999999 else 0.0
     except (ValueError, TypeError):
         return 0.0
 
@@ -224,6 +237,26 @@ def extract_alipay_links(content):
     """从邮件正文 HTML 提取支付宝发票直链（mdn.alipayobjects.com/...pdf）。"""
     links = set()
     for m in re.finditer(r'https?://mdn\.alipayobjects\.com/[^\s"\'<>]+?\.pdf(?:\?[^\s"\'<>]*)?', content or ""):
+        links.add(m.group(0))
+    return sorted(links)
+
+
+def extract_oss_links(content):
+    """从邮件正文 HTML 提取阿里云 OSS 商家发票直链（淘宝闪购等平台）。
+
+    特征：fin-invoice-*.oss-cn-*.aliyuncs.com/cInvoice/manualInvoice/*.jpg
+    链接带签名参数（Expires/OSSAccessKeyId/Signature），须从正文实时提取。
+    """
+    links = set()
+    if not content:
+        return []
+    # 还原常见 HTML 实体（&amp; 等）
+    text = content.replace("&amp;", "&")
+    # OSS 域名下的 cInvoice/manualInvoice 图片
+    for m in re.finditer(
+        r'https?://[a-z0-9-]*\.?oss-cn-[a-z0-9-]+\.aliyuncs\.com/'
+        r'cInvoice/[^\s"\'<>]+?\.(?:jpg|jpeg|png)(?:\?[^\s"\'<>]*)?',
+        text, re.I):
         links.add(m.group(0))
     return sorted(links)
 
@@ -620,6 +653,15 @@ class ApiDownloadController:
                 self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
                 return
 
+            # 3.5) 阿里云 OSS 商家发票图片（淘宝闪购等平台）
+            oss_links = extract_oss_links(content)
+            if oss_links:
+                amounts = self._download_oss_links(oss_links, subject, date_str, text, sender)
+                if self.downloaded_pdf_count > before:
+                    self._total_amount += sum(amounts)
+                self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+                return
+
             # 4) 已知发票号码：fapiao/download
             no = extract_invoice_no(subject)
             if no:
@@ -733,13 +775,32 @@ class ApiDownloadController:
             else:
                 temp_pdfs.append((tmp_path, kind, name))
 
-        # ---- 阶段1.5：提取消费日期（取最早的作为真实消费日期）----
+        # ---- 阶段1.5：提取消费日期 + 用 PDF 票面识别修正发票类型 ----
+        rail_infos = {}  # tmp_path → railway_info（高铁 PDF 专用）
+        pdf_kinds = {}  # tmp_path → kind_from_pdf 修正后的类型
         self.log(f"    📋 临时文件 {len(temp_pdfs)} 个")
         for tmp_path, kind, orig_name in temp_pdfs:
             exists = os.path.exists(tmp_path)
             sz = os.path.getsize(tmp_path) if exists else 0
             self.log(f"    🔍 [{kind}] {orig_name} → {tmp_path} exists={exists} size={sz}")
             if tmp_path.lower().endswith(".pdf") and exists:
+                pdf_text = self._pdf_text(tmp_path)
+                # 票面类型识别（铁路/航空/通行费/餐饮等），覆盖邮件关键词粗判
+                pdf_kind = kind_from_pdf(pdf_text) if pdf_text else ""
+                if pdf_kind and pdf_kind != kind:
+                    self.log(f"    🏷 票面识别: {kind} → {pdf_kind}（依据 PDF 项目名称）")
+                    kind = pdf_kind
+                    pdf_kinds[tmp_path] = pdf_kind
+                # 高铁发票：优先从 PDF 提取乘车日期/票价（邮件正文常含订单号干扰）
+                if "高铁" in kind or "铁路" in kind:
+                    rw = self._railway_info_from_pdf(tmp_path)
+                    if rw.get("date") or rw.get("amount"):
+                        rail_infos[tmp_path] = rw
+                        d = rw.get("date") or ""
+                        self.log(f"    🚄 铁路客票PDF: 乘车={d or '?'} 票价={rw.get('amount') or 0}")
+                        if d and (not shared_date or d < shared_date):
+                            shared_date = d
+                        continue  # PDF 信息优先，跳过通用正则
                 d = self._consume_date_from_file(tmp_path)
                 self.log(f"    🔍 consume_date result={d!r}")
                 if d:
@@ -761,7 +822,8 @@ class ApiDownloadController:
             if not os.path.exists(tmp_path):
                 self.log(f"    💾 跳过不存在: {tmp_path}")
                 continue
-            fname = build_filename(kind, orig_name, shared_date, msg=text)
+            kind = pdf_kinds.get(tmp_path, kind)  # 票面识别结果优先
+            fname = build_filename(kind, orig_name, shared_date, msg=text, rw=rail_infos.get(tmp_path))
             dest = unique_path(self.save_dir, fname)
             self.log(f"    💾 移动 {os.path.basename(tmp_path)} → {os.path.basename(dest)}")
             try:
@@ -770,7 +832,6 @@ class ApiDownloadController:
                 self.log(f"    💾 移动失败: {e}")
                 dest = tmp_path
             grant_current_user_access(dest)
-            self.log(f"    ✓ 已保存：{os.path.basename(dest)}")
             self.report_downloaded(dest)
             mail_amounts.add(extract_amount_from_text(os.path.basename(dest)))
 
@@ -781,6 +842,18 @@ class ApiDownloadController:
             pass
 
         return mail_amounts
+
+    def _pdf_text(self, filepath):
+        """读取 PDF 全文文本，失败返回空串。"""
+        try:
+            import pymupdf  # PyMuPDF
+            doc = pymupdf.open(filepath)
+            try:
+                return "".join(page.get_text() or "" for page in doc)
+            finally:
+                doc.close()
+        except Exception:
+            return ""
 
     def _consume_date_from_file(self, filepath):
         """从本地 PDF 文件提取消费日期。"""
@@ -816,6 +889,51 @@ class ApiDownloadController:
         except Exception:
             pass
         return ""
+
+    def _railway_info_from_pdf(self, filepath):
+        """从铁路电子客票 PDF 提取乘车信息（乘车日期/开票日期/车次/路线/票价）。
+
+        12306 铁路电子客票 PDF 有两种文本布局：
+          A) 车次与日期相邻 + 票价同行：G258\n2026年08月06日 / 票价:￥87.00
+          B) 车次与日期隔英文站名 + 票价分离：G901\nShanghaihongqiao\nHangzhouxi\n
+             2026年08月09日 / 票价:\n...\n￥120.00（金额独立行）
+        返回 dict：{date, issue_date, train, route, amount}，提取不到为空串/0。
+        """
+        info = {"date": "", "issue_date": "", "train": "", "route": "", "amount": 0.0}
+        try:
+            t = self._pdf_text(filepath)
+            if not t:
+                return info
+            # 票价：优先「票价:￥87.00」同行；否则找独立「￥120.00」金额行
+            m = re.search(r"票价[：:\s]*[¥￥]?\s*(\d+(?:\.\d+)?)", t)
+            if not m:
+                m = re.search(r"[¥￥]\s*(\d+(?:\.\d+)?)", t)
+            if m:
+                try:
+                    info["amount"] = float(m.group(1))
+                except ValueError:
+                    pass
+            # 车次：任意 [A-Z]1-4 位数字（如 G258 / G901）
+            m = re.search(r"([A-Z]\d{1,4})", t)
+            if m:
+                info["train"] = m.group(1)
+            # 乘车日期：独立匹配「20xx年x月x日」，排除开票日期行
+            # （先剔除开票日期段，避免把开票日期当乘车日期）
+            rest = re.sub(r"开票日期[：:\s]*20\d{2}年\d{1,2}月\d{1,2}日", "", t)
+            m = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日)", rest)
+            if m:
+                info["date"] = _cn_date_to_iso(m.group(1))
+            # 开票日期
+            m = re.search(r"开票日期[：:\s]*(20\d{2}年\d{1,2}月\d{1,2}日)", t)
+            if m:
+                info["issue_date"] = _cn_date_to_iso(m.group(1))
+            # 路线：两个「xxx站」
+            stations = re.findall(r"[\u4e00-\u9fa5]{2,6}站", t)
+            if len(stations) >= 2:
+                info["route"] = f"{stations[0]}-{stations[1]}"
+        except Exception:
+            pass
+        return info
 
     def _rename_with_date(self, filepath, new_date):
         """用新日期重命名文件，返回新路径。"""
@@ -939,6 +1057,28 @@ class ApiDownloadController:
                 amounts.add(extract_amount_from_text(os.path.basename(dest)))
             else:
                 self.log(f"    ✗ 支付宝下载失败 {u[:60]}")
+        return amounts
+
+    def _download_oss_links(self, links, subject, date_str, text, sender=""):
+        """下载阿里云 OSS 商家发票图片（淘宝闪购等平台手动上传的发票照片/扫描件）。
+
+        图片可能是 jpg/png，保存时保留原扩展名。返回金额集合（从实际保存文件名提取）。
+        """
+        amounts = set()
+        for u in links:
+            if self.stop_flag:
+                break
+            kind = invoice_kind(subj=subject, body=text, sender=sender)
+            ext = os.path.splitext(urllib.parse.urlparse(u).path)[1] or ".jpg"
+            fname = build_filename(kind, subject, date_str, msg=text)
+            base, _ = os.path.splitext(fname)
+            dest = unique_path(self.save_dir, f"{base}{ext}")
+            self.log(f"    ↓ OSS 商家发票下载 {os.path.basename(dest)}")
+            if self._api.download_attach(u, dest):
+                self.report_downloaded(dest)
+                amounts.add(extract_amount_from_text(os.path.basename(dest)))
+            else:
+                self.log(f"    ✗ OSS 下载失败 {u[:60]}")
         return amounts
 
     def report_downloaded(self, path):

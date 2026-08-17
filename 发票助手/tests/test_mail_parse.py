@@ -46,6 +46,39 @@ class TestInvoiceKind:
         assert mail_parse.invoice_kind(att_name="高铁.pdf") == "高铁发票"
 
 
+class TestKindFromPdf:
+    """票面识别：从 PDF 文本（项目名称/票面标识）判断发票类型。"""
+
+    def test_railway(self):
+        t = "国家税务总局 全国统一发票监制章 买票请到12306 电子发票（铁路电子客票） 票价:￥87.00"
+        assert mail_parse.kind_from_pdf(t) == "高铁发票"
+
+    def test_air(self):
+        t = "电子发票（航空运输电子客票行程单） 旅客姓名 航班号 承运人"
+        assert mail_parse.kind_from_pdf(t) == "机票发票"
+
+    def test_highway(self):
+        t = "浙江通行费电子发票 通行时间 2026-08-12 高速公路通行费 21.00元"
+        assert mail_parse.kind_from_pdf(t) == "高速发票"
+
+    def test_catering(self):
+        t = "上海增值税电子普通发票 *生产生活服务*美式Iced American（冰） 金额31.13"
+        assert mail_parse.kind_from_pdf(t) == "餐饮发票"
+
+    def test_hotel(self):
+        t = "电子发票 住宿服务*标准间 酒店 入住时间"
+        assert mail_parse.kind_from_pdf(t) == "酒店发票"
+
+    def test_taxi(self):
+        t = "滴滴出行 电子发票 运输服务*客运服务费 行程单"
+        assert mail_parse.kind_from_pdf(t) == "打车发票"
+
+    def test_unknown_keep_original(self):
+        # 识别不到返回空串，调用方保持原分类
+        assert mail_parse.kind_from_pdf("普通电子发票 货物或应税劳务、服务名称 软件服务费") == ""
+        assert mail_parse.kind_from_pdf("") == ""
+
+
 class TestRailwayInfo:
     HTML = (
         "<html><table>"

@@ -433,20 +433,30 @@ class WebClient(QObject):
     checkedEls.push(el);
   }
   var stored=readAll();
-  // 只采用 localStorage 中「当前 DOM 仍处于勾选状态」的记录，避免取消勾选后残留旧记录。
-  // 滚出视图的邮件（DOM 中无此项）无法核对，若之前勾选过则保留（用户主动勾选未取消）。
+  // 合并策略：
+  //  - localStorage 记录 + DOM 中存在该项 → 用 DOM 当前勾选状态（勾选保留，取消丢弃）
+  //  - localStorage 记录 + DOM 中无该项（滚出视图/翻页）→ 保留（用户主动勾选且无法核对取消）
+  //    （旧逻辑误把「滚出视图的已勾选邮件」当「已取消勾选」丢弃，导致漏下载）
+  var domMailids={};
+  for(var di=0;di<checkedEls.length;di++){
+    domMailids[checkedEls[di].getAttribute('data-mailid')||'']=true;
+  }
+  // DOM 中所有 list-item 的 mailid（无论是否勾选，用于判断该项是否在视口内）
+  var domAll={};
+  for(var ai=0;ai<items.length;ai++){
+    var _mid=items[ai].getAttribute('data-mailid')||'';
+    if(_mid)domAll[_mid]=true;
+  }
   for(var k in stored){
     var d=stored[k];
     if(!d||!d.mailid)continue;
-    var stillChecked=false;
-    for(var ii=0;ii<checkedEls.length;ii++){
-      if((checkedEls[ii].getAttribute('data-mailid')||'')===d.mailid){stillChecked=true;break;}
+    if(domAll[d.mailid]){
+      // 在视口内：必须仍处于勾选状态才保留
+      if(!domMailids[d.mailid])continue;  // 已取消勾选 → 丢弃
     }
-    if(stillChecked){
-      if(!d.message_id&&mids[d.mailid])d.message_id=mids[d.mailid];
-      merged[k]=d;
-    }
-    // DOM 中已取消勾选 → 丢弃（不再下载）
+    // 不在视口内（滚出视图）：保留（用户勾选过，未确认取消）
+    if(!d.message_id&&mids[d.mailid])d.message_id=mids[d.mailid];
+    merged[k]=d;
   }
   var out=[];
   for(var k2 in merged){out.push(merged[k2]);}

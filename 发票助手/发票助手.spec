@@ -51,11 +51,44 @@ a = Analysis(
     optimize=2,
 )
 # 过滤 QtWebEngine 的 debug 资源（release 运行不需要；节省约 77 MB）
-# devtools_resources.pak（11 MB，非 debug）留待激进方案处理
-_keep = lambda d: not (d[0].endswith('.debug.pak') or d[0].endswith('.debug.bin'))
-a.datas = [d for d in a.datas if _keep(d)]
-
-# ── QtWebEngine 轻量化：只保留依赖链上的 Qt DLL ──
+# 激进方案：同时过滤 devtools_resources.pak（不用 F12 开发者工具）
+def _keep_data(d):
+    dest = d[0].replace('\\', '/')
+    if dest.endswith('.debug.pak') or dest.endswith('.debug.bin'):
+        return False
+    # 非 debug 版 devtools 前端（11 MB），普通使用不需要
+    if dest.endswith('qtwebengine_devtools_resources.pak'):
+        return False
+    # ── 激进方案：裁剪 translations ──
+    # 只保留中文翻译 + WebEngine 必用的 locales 中 zh/en 语言包
+    if '/translations/' in dest:
+        if 'qtwebengine_locales' in dest:
+            # Chromium 语言包：仅保留 zh-CN / zh-TW / en-US / en-GB
+            base = dest.rsplit('/', 1)[-1].lower()
+            return any(k in base for k in ('zh-cn.pak', 'zh-tw.pak', 'en-us.pak', 'en-gb.pak'))
+        # qt*.qm 翻译：只保留中文
+        name = dest.rsplit('/', 1)[-1]
+        if name.endswith('.qm') and 'zh_CN' not in name and 'zh_TW' not in name:
+            return False
+        return True
+    # ── 激进方案：裁剪 qml 目录（WebEngine 不需要 QML UI 组件）──
+    if '/qml/' in dest:
+        # 保留 WebEngine 运行必需的最小 QML 核心
+        keep_prefixes = (
+            '/qml/QtWebEngine/',
+            '/qml/QtQuick/Window',
+            '/qml/QtQml/',
+            '/qml/QtCore/',
+            '/qml/QtNetwork/',
+            '/qml/Qt/labs/',
+        )
+        for p in keep_prefixes:
+            if p in dest:
+                return True
+        # qml 目录中的其他内容全部删除
+        return False
+    return True
+a.datas = [d for d in a.datas if _keep_data(d)]
 # 从 Qt6WebEngineCore/WebEngineWidgets 出发做 BFS 依赖分析，得到必需 DLL 白名单。
 # excludes 只能拦截 Python 模块，无法拦截 Qt hook 收集的 DLL，需在此直接过滤。
 _QT_KEEP_DLL = {
@@ -68,9 +101,34 @@ _QT_KEEP_DLL = {
 import os as _os
 def _keep_bin(entry):
     # entry 是 (dest, src, typecode) 三元组，dest 为相对目标路径
+    dest = entry[0].replace('\\', '/')
     name = _os.path.basename(entry[0])
+    # 1) 顶层 Qt DLL 白名单
     if name.startswith('Qt6') and name.endswith('.dll'):
         return name in _QT_KEEP_DLL
+    # 2) qmltooling 调试插件（QML 调试工具，运行不需要）
+    if '/plugins/qmltooling/' in dest:
+        return False
+    # 3) qml 插件 DLL：只保留 WebEngine 运行必需的最小 QML 核心
+    if '/qml/' in dest:
+        keep_qml = (
+            '/qml/QtWebEngine/',
+            '/qml/QtWebChannel/',
+            '/qml/QtQml/',
+            '/qml/QtCore/',
+            '/qml/QtNetwork/',
+            '/qml/QtQuick/Window',
+            '/qml/QtQuick.2/',
+            '/qml/Qt/labs/',
+        )
+        for p in keep_qml:
+            if p in dest:
+                return True
+        return False
+    # 4) qtwebengine_locales 语言包：仅保留 zh-CN / zh-TW / en（其余全删）
+    if '/translations/qtwebengine_locales/' in dest:
+        base = name.lower()
+        return any(k in base for k in ('zh-cn.pak', 'zh-tw.pak', 'en-us.pak'))
     return True
 a.binaries = [b for b in a.binaries if _keep_bin(b)]
 pyz = PYZ(a.pure)

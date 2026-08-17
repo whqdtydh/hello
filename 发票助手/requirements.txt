@@ -1,5 +1,6 @@
 PySide6>=6.6
 requests>=2.31
+PyMuPDF>=1.24
 
 # 可选：仅运行 make_icon.py 重新生成图标时需要
-pillow>=10.0
+# pillow>=10.0

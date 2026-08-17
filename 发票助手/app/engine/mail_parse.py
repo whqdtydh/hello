@@ -1,62 +1,10 @@
-"""邮件解析纯函数：MIME 解码、正文/附件提取、文本特征与发票信息解析。
+"""邮件解析纯函数：正文/附件文本提取与发票信息解析。
 
 本模块不依赖 IMAP 连接或 Qt，全部为无副作用函数，可独立测试。
-供 imap_engine（IMAP 下载）与 downloader（网页嗅探命名）共同使用，
-避免两者互相 import 造成循环依赖。
+供 api_downloader（API 下载）使用。
 """
 
-import html
-import os
 import re
-import json
-import requests
-from email.header import decode_header
-from email.utils import parsedate_to_datetime
-from urllib.parse import parse_qs, unquote, urlparse
-
-
-def decode_mime(s):
-    """解码 MIME 编码的字符串（=?UTF-8?B?...?= 或 =?GBK?...?=）。"""
-    if not s:
-        return ""
-    parts = decode_header(s)
-    out = []
-    for text, enc in parts:
-        if isinstance(text, bytes):
-            try:
-                out.append(text.decode(enc or "utf-8", "replace"))
-            except (LookupError, TypeError):
-                out.append(text.decode("utf-8", "replace"))
-        else:
-            out.append(text)
-    return "".join(out)
-
-
-def header_date(msg):
-    """从邮件 header Date 提取 YYYY-MM-DD。"""
-    raw = msg.get("Date", "")
-    try:
-        dt = parsedate_to_datetime(raw)
-        return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
-    except Exception:
-        return ""
-
-
-def extract_attachments(msg):
-    """从邮件对象提取附件列表 [(filename, data)]。"""
-    atts = []
-    for part in msg.walk():
-        if part.get_content_maintype() == "multipart":
-            continue
-        fname = part.get_filename()
-        if not fname:
-            continue
-        fname = decode_mime(fname)
-        payload = part.get_payload(decode=True)
-        if payload is None:
-            continue
-        atts.append((fname, payload))
-    return atts
 
 
 def _decode_html(part):
@@ -75,99 +23,6 @@ def _decode_html(part):
             except Exception:
                 continue
     return ""
-
-
-def body_text(msg):
-    """提取邮件正文纯文本（优先 text/plain，其次 text/html 去标签）。"""
-    try:
-        for part in msg.walk():
-            if part.get_content_maintype() == "multipart":
-                continue
-            if part.get_content_type() == "text/plain":
-                payload = part.get_payload(decode=True)
-                if payload:
-                    return payload.decode(
-                        part.get_content_charset() or "utf-8", "replace")
-        for part in msg.walk():
-            if part.get_content_type() == "text/html":
-                body = _decode_html(part)
-                if body:
-                    return re.sub(r"<[^>]+>", " ", html.unescape(body))
-    except Exception:
-        return ""
-    return ""
-
-
-def subject_hash(text):
-    """从勾选邮件文本中提取主题哈希（如 5dbad55a...）。
-
-    浙江通行费主题形如「浙江通行费电子发票_<32位hex>」，
-    哈希是唯一标识，可精确匹配 IMAP 邮件。
-    """
-    if not text:
-        return ""
-    m = re.search(r"[_-]([a-fA-F0-9]{16,64})", text)
-    return m.group(1) if m else ""
-
-
-def text_keywords(text):
-    """从勾选文本提取有区分度的中文关键词（公司名/业务词）。
-
-    例如「【电子发票】您收到一张来自【上海华铁旅客服务有限公司】价税合计」
-    提取 → [电子发票, 上海华铁旅客服务有限公司, 价税合计]。
-    返回按长度降序排列（越长越有区分度）。
-    """
-    if not text:
-        return []
-    candidates = set()
-    # 公司名：【xxx】内的内容
-    for m in re.finditer(r"【([^】]+)】", text):
-        kw = m.group(1).strip()
-        if kw:
-            candidates.add(kw)
-    # 含「电子发票/发票/行程单/价税/旅客」的长片段
-    for kw in re.findall(r"[一-龥]{2,20}(?:电子发票|发票|行程单|价税合计|旅客服务)", text):
-        if kw:
-            candidates.add(kw)
-    # 全部中文连续串（去重，>2字）
-    for m in re.findall(r"[一-龥]{2,}", text):
-        candidates.add(m)
-    # 去除非发票相关的通用词
-    drop = {"验证您的电子邮箱地址", "网上购票系统", "购票系统"}
-    candidates -= drop
-    # 按长度降序，优先用长关键词
-    return sorted(candidates, key=len, reverse=True)
-
-
-def text_date(text):
-    """从勾选文本提取业务日期（如「2026年8月11日」→ 2026-08-11）。
-
-    12306/高德等邮件正文常含乘车/行程日期，用它区分多封同发件人邮件。
-    支持「2026年8月11日」「8月11日」「2026-08-11」「08/11」等格式。
-    """
-    if not text:
-        return ""
-    try:
-        m = re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", text)
-        if m:
-            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        m = re.search(r"(\d{1,2})月(\d{1,2})日", text)
-        if m:
-            return f"{int(m.group(1)):02d}-{int(m.group(2)):02d}"
-        m = re.search(r"(20\d{2})-(\d{1,2})-(\d{1,2})", text)
-        if m:
-            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        m = re.search(r"(20\d{2})/(\d{1,2})/(\d{1,2})", text)
-        if m:
-            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    except Exception:
-        return ""
-    return ""
-
-
-def is_railway(subj):
-    """判断是否为 12306 高铁邮件（主题含「网上购票」「高铁」「12306」等）。"""
-    return any(k in (subj or "") for k in ("网上购票", "12306", "高铁"))
 
 
 def railway_info(msg):
@@ -237,8 +92,8 @@ def ticket_amount(msg):
     """从邮件正文提取金额。
 
     兼容两种输入：
-    - email.message.Message 对象（IMAP 路径）：优先 12306 高铁票价，再回退通用格式
-    - 纯文本字符串（API 路径）：通用金额格式（价税合计金额为33.00 / 金额为33.00 /
+    - email.message.Message 对象：优先 12306 高铁票价，再回退通用格式
+    - 纯文本字符串：通用金额格式（价税合计金额为33.00 / 金额为33.00 /
       票价 87.00 / 33.00元 等）
     返回 float 或 0.0。
     """
@@ -282,80 +137,6 @@ def ticket_amount(msg):
         except ValueError:
             pass
     return 0.0
-
-
-def alipay_pdf_link(msg):
-    """从邮件正文提取支付宝电子发票 PDF 直链（alipayobjects.com）。
-
-    优先返回带 .pdf 后缀的直链；找不到返回空串。
-    """
-    try:
-        for part in msg.walk():
-            if part.get_content_type() != "text/html" or part.get_filename():
-                continue
-            body = _decode_html(part)
-            if not body:
-                continue
-            for m in re.finditer(r'https?://[^\s"<>]+', body):
-                url = m.group(0)
-                if "alipayobjects.com" in url and ".pdf" in url.lower():
-                    return url
-            break
-    except Exception:
-        pass
-    return ""
-
-
-def att_amount(msg):
-    """从邮件附件名提取金额（如「82.94元」→ 82.94）。
-
-    高德：附件名含金额；高速费：zip 名含金额。返回 float 或 0.0。
-    12306 高铁附件名是发票号.zip（无金额），回退用邮件正文的票价；
-    支付宝通知无附件，回退用正文 PDF 直链文件名里的金额。
-    """
-    for fname, _data in extract_attachments(msg):
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)元", fname)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
-    # 高铁邮件：附件名无金额，用正文票价
-    subj = decode_mime(msg.get("Subject", ""))
-    if is_railway(subj):
-        return railway_info(msg).get("amount", 0.0)
-    # 支付宝通知：从 PDF 直链文件名提取金额
-    link = alipay_pdf_link(msg)
-    if link:
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)元", link)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                pass
-    return 0.0
-
-
-def alipay_filename(link, default):
-    """从支付宝直链 URL 提取规范文件名（优先 af_fileName / fileName 参数）。
-
-    形如 .../invoice_xxx.pdf?af_fileName=63.30元-上海...-电子发票.pdf
-    取不到时回退 default。
-    """
-    query = parse_qs(urlparse(link).query)
-    fn = ""
-    if query.get("af_fileName"):
-        fn = query["af_fileName"][0]
-    elif query.get("fileName"):
-        fn = query["fileName"][0]
-    if fn:
-        fn = unquote(fn)
-    if not fn.lower().endswith(".pdf"):
-        base = os.path.basename(urlparse(link).path)
-        fn = unquote(base)
-    if not fn or not fn.lower().endswith(".pdf"):
-        return default
-    return fn
 
 
 # 发票类型关键词：按优先级从高到低判断（子串命中即可）

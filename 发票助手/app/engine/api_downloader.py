@@ -20,6 +20,8 @@ import urllib.parse
 import requests
 
 from app import config
+from app.engine.acl_util import grant_current_user_access
+from app.engine.api_registry import ApiRegistry
 from app.engine.mail_parse import invoice_kind, ticket_amount, consume_date
 from app.engine.web_client import WebClient
 
@@ -34,14 +36,6 @@ def is_invoice_mail(item_text):
     if any(kw in low for kw in config.INVOICE_FROM_KEYWORDS):
         return True
     return "发票" in item_text or "行程单" in item_text
-
-
-def normalize_date(date_str):
-    try:
-        y, mo, d = date_str.split("-")
-        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
-    except Exception:
-        return ""
 
 
 def date_label(date_str):
@@ -245,14 +239,19 @@ def extract_invoice_no(subject):
 # ---------- API 客户端 ----------
 
 class QQMailApi:
-    """封装 QQ 邮箱网页接口（纯 requests，不依赖网页 UI）。"""
+    """封装 QQ 邮箱网页接口（纯 requests，不依赖网页 UI）。
+
+    接口路径从 ApiRegistry 读取（默认值为逆向基准），腾讯改版后可通过
+    失效自动学习机制更新，无需改代码。
+    """
 
     BASE = "https://wx.mail.qq.com"
 
-    def __init__(self, cookies, sid, on_log=None):
+    def __init__(self, cookies, sid, on_log=None, registry=None):
         self.cookies = cookies          # requests CookieJar
         self.sid = sid or ""
         self.on_log = on_log or (lambda m: None)
+        self.registry = registry        # ApiRegistry（可选）
         self.session = requests.Session()
         self.session.cookies = cookies
         self.session.headers.update({
@@ -262,6 +261,21 @@ class QQMailApi:
             "Referer": "https://wx.mail.qq.com/home/index",
         })
 
+    # ---------- 接口路径（注册表优先） ----------
+    def _ep_path(self, name):
+        """返回接口路径（可能已被学习覆盖），默认回退基准值。"""
+        if self.registry:
+            p = self.registry.get_path(name)
+            if p:
+                return p
+        from app.engine.api_registry import DEFAULT_ENDPOINTS
+        return DEFAULT_ENDPOINTS.get(name, {}).get("path", "/" + name)
+
+    def _mark_failed(self, name):
+        """标记接口失效（触发自动学习流程）。"""
+        if self.registry:
+            self.registry.mark_failed(name)
+
     def _url(self, path):
         sep = "&" if "?" in path else "?"
         return f"{self.BASE}{path}{sep}sid={urllib.parse.quote(self.sid)}&r={int(time.time()*1000)}"
@@ -269,14 +283,20 @@ class QQMailApi:
     def fetch_maillist(self, page_now=0, page_size=50, dirid=1):
         """拉取一页邮件列表。返回 list（可能为空）。"""
         url = self._url(
-            f"/list/maillist?dir=1&dirid={dirid}&func=1&sort_type=1&sort_direction=1"
+            f"{self._ep_path('maillist')}?dir=1&dirid={dirid}&func=1&sort_type=1&sort_direction=1"
             f"&page_now={page_now}&page_size={page_size}&enable_topmail=true")
-        r = self.session.get(url, timeout=20)
-        r.raise_for_status()
+        try:
+            r = self.session.get(url, timeout=20)
+            r.raise_for_status()
+        except Exception as e:
+            self.on_log(f"⚠ maillist 请求异常: {str(e)[:60]}")
+            self._mark_failed("maillist")
+            return []
         j = r.json()
         head = j.get("head", {})
         if head.get("ret") != 0:
             self.on_log(f"⚠ maillist ret={head.get('ret')} msg={head.get('msg','')[:60]}")
+            self._mark_failed("maillist")
             return []
         return j.get("body", {}).get("list", []) or []
 
@@ -297,17 +317,24 @@ class QQMailApi:
 
     def fetch_readmail(self, mailid, func=1):
         """拉取邮件详情。返回 body.item dict（含 content 正文 HTML）。"""
-        url = self._url("/read/readmail")
-        r = self.session.post(url, data={"mailid": mailid, "func": func}, timeout=20)
-        r.raise_for_status()
+        url = self._url(self._ep_path("readmail"))
+        try:
+            r = self.session.post(url, data={"mailid": mailid, "func": func}, timeout=20)
+            r.raise_for_status()
+        except Exception as e:
+            self.on_log(f"⚠ readmail 请求异常: {str(e)[:60]}")
+            self._mark_failed("readmail")
+            return {}
         j = r.json()
         head = j.get("head", {})
         if head.get("ret") != 0:
             self.on_log(f"⚠ readmail ret={head.get('ret')} msg={head.get('msg','')[:60]}")
+            self._mark_failed("readmail")
             return {}
         item = j.get("body", {}).get("item", {}) or {}
         if str(item.get("ret", "0")) != "0":
             self.on_log(f"⚠ readmail item.ret={item.get('ret')}")
+            self._mark_failed("readmail")
             return {}
         return item
 
@@ -321,8 +348,11 @@ class QQMailApi:
     def download_fapiao(self, no, code, name, dest_path):
         """已知发票号码：/fapiao/download?fapiao_list={"fapiao":[{"no","code"}]}"""
         fapiao_list = urllib.parse.quote(json.dumps({"fapiao": [{"no": no, "code": code or ""}]}))
-        url = self._url(f"/fapiao/download?fapiao_list={fapiao_list}&name={urllib.parse.quote(name)}")
-        return self._download(url, dest_path)
+        url = self._url(f"{self._ep_path('fapiao')}?fapiao_list={fapiao_list}&name={urllib.parse.quote(name)}")
+        ok = self._download(url, dest_path)
+        if not ok:
+            self._mark_failed("fapiao")
+        return ok
 
     def download_51fapiao(self, dlj_url, dest_path):
         """51fapiao 链接型下载。
@@ -381,6 +411,7 @@ class QQMailApi:
                 with open(dest_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=65536):
                         f.write(chunk)
+            grant_current_user_access(dest_path)
             return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
         except Exception as e:
             self.on_log(f"⚠ 下载失败 {os.path.basename(dest_path)}: {str(e)[:80]}")
@@ -390,13 +421,20 @@ class QQMailApi:
 # ---------- 控制器 ----------
 
 class ApiDownloadController:
-    """纯 API 下载控制器：勾选 -> 拉列表 -> 分类下载。"""
+    """纯 API 下载控制器：勾选 -> 拉列表 -> 分类下载。
+
+    集成接口失效自动学习：
+      本次运行检测到接口失败 -> 标记 failed + 日志提示用户手动操作网页
+      （JS hook 自动记录请求）；下次运行开始时读取观察记录，特征匹配
+      更新注册表后，用新接口路径继续下载。
+    """
 
     def __init__(self, client: WebClient, save_dir, on_log=None, on_progress=None):
         self.client = client
         self.save_dir = save_dir
         self.on_log = on_log or (lambda m: None)
         self.on_progress = on_progress or (lambda p, t, d: None)
+        self.registry = ApiRegistry()
 
         self.downloaded_files = []
         self.downloaded_pdf_count = 0
@@ -407,12 +445,41 @@ class ApiDownloadController:
     def log(self, msg):
         self.on_log(msg)
 
+    def _maybe_learn_api(self):
+        """运行前检查：若有 failed 接口，从观察记录学习新接口路径。
+
+        学习成功返回更新的接口名列表；无 failed 或未学习到返回 []。
+        注意：本方法不阻塞，学习失败只是日志提示，不中断主流程。
+        """
+        failed = self.registry.failed_endpoints()
+        if not failed:
+            return []
+        self.log(f"🔁 检测到 {len(failed)} 个接口可能已变更: {', '.join(failed)}，尝试从网页观察记录学习…")
+        observations = self.client.get_observed_requests()
+        if not observations:
+            self.log("  暂无网页请求记录。请在左侧网页中手动操作一次"
+                     "（打开收件箱 / 打开一封邮件 / 下载一次发票），再点击开始下载。")
+            # 开启观察，为下次学习做准备
+            try:
+                self.client.start_api_observe()
+            except Exception:
+                pass
+            return []
+        updated = self.registry.learn_from_observations(observations)
+        if updated:
+            self.registry.clear_failed()
+            self.log(f"✅ 已学习到新接口: {', '.join(updated)}，本次将使用新接口重试")
+        else:
+            self.log("  观察记录未能匹配到新接口（可能页面未产生同类请求）。"
+                     "请手动操作一次后再试。")
+        return updated
+
     def _build_api(self, sid=None):
         """从 WebClient 的 cookie store 构建 QQMailApi。sid 优先用外部传入（GUI 线程已取好）。"""
         jar = self.client.cookies.get_cookie_jar("https://wx.mail.qq.com/")
         if not sid:
             sid = self.client.cookies.get_cookie_value("xm_sid") or ""
-        return QQMailApi(jar, sid, on_log=self.log)
+        return QQMailApi(jar, sid, on_log=self.log, registry=self.registry)
 
     def run(self, selected_mails, sid=None):
         """selected_mails: 用户勾选的邮件 [{mailid, subject, sender, text}]
@@ -421,6 +488,8 @@ class ApiDownloadController:
         if not selected_mails:
             self.log("没有检测到勾选的邮件。请先在左侧网页中勾选需要下载的邮件。")
             return []
+        # 接口失效学习：运行前检查 failed 接口，尝试从网页观察记录更新路径
+        self._maybe_learn_api()
         self.prepare(selected_mails, sid=sid)
         while self.process_next():
             pass
@@ -441,7 +510,9 @@ class ApiDownloadController:
             try:
                 os.replace(f, os.path.join(sub, os.path.basename(f)))
                 moved += 1
-                self.downloaded_files[self.downloaded_files.index(f)] = os.path.join(sub, os.path.basename(f))
+                new_f = os.path.join(sub, os.path.basename(f))
+                self.downloaded_files[self.downloaded_files.index(f)] = new_f
+                grant_current_user_access(new_f)
             except Exception:
                 pass
         self.log(f"  已新建文件夹「{os.path.basename(sub)}」，移入 {moved} 个 PDF")
@@ -461,6 +532,14 @@ class ApiDownloadController:
             self.log(f"  maillist 缓存 {len(self._mail_cache)} 封")
         except Exception as e:
             self.log(f"  ⚠ 拉取邮件列表失败: {str(e)[:60]}（将逐封查询）")
+        # 若存在 failed 接口，开启网页观察并提示用户手动操作（供下次学习）
+        if self.registry.failed_endpoints():
+            self.log("  💡 接口失效：请手动在左侧网页操作一次（打开收件箱/打开邮件/下载发票），"
+                     "程序会自动记录并学习新接口，下次下载将自动使用新接口。")
+            try:
+                self.client.start_api_observe()
+            except Exception:
+                pass
         self.log(f"检测到勾选 {self._total} 封邮件，开始处理…")
 
     def process_next(self):
@@ -690,6 +769,7 @@ class ApiDownloadController:
             except Exception as e:
                 self.log(f"    💾 移动失败: {e}")
                 dest = tmp_path
+            grant_current_user_access(dest)
             self.log(f"    ✓ 已保存：{os.path.basename(dest)}")
             self.report_downloaded(dest)
             mail_amounts.add(extract_amount_from_text(os.path.basename(dest)))
@@ -709,25 +789,30 @@ class ApiDownloadController:
                 data = f.read()
             d = self._consume_date_from_pdf(data)
             if not d:
-                self.log(f"    📅 pdfplumber未提取到日期: {os.path.basename(filepath)}")
+                self.log(f"    📅 PyMuPDF未提取到日期: {os.path.basename(filepath)}")
             return d
         except Exception as e:
             self.log(f"    📅 读取PDF失败: {str(e)[:60]}")
             return ""
 
     def _consume_date_from_pdf(self, data):
-        """从 PDF 二进制内容提取消费日期（行程时间/通行时间/出行日期/上车时间）。"""
+        """从 PDF 二进制内容提取消费日期（行程时间/通行时间/出行日期/上车时间）。
+
+        使用 PyMuPDF 提取文本（轻量、无重依赖，避免 pdfplumber 引入 pandas 全家桶）。
+        """
         if not data:
             return ""
         try:
-            import io as _io
-            import pdfplumber
-            with pdfplumber.open(_io.BytesIO(data)) as pdf:
-                for pg in pdf.pages:
-                    t = pg.extract_text() or ""
+            import pymupdf  # PyMuPDF
+            doc = pymupdf.open(stream=data, filetype="pdf")
+            try:
+                for page in doc:
+                    t = page.get_text() or ""
                     d = consume_date(t)
                     if d:
                         return d
+            finally:
+                doc.close()
         except Exception:
             pass
         return ""

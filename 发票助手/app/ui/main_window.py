@@ -247,9 +247,13 @@ class MainWindow(QWidget):
         QTimer.singleShot(3000, self.on_load_mail)
 
     def _load_wallpaper(self):
+        # PyInstaller 打包后资源在 sys._MEIPASS；开发模式在项目根目录
+        base = getattr(sys, "_MEIPASS", None)
+        if not base:
+            base = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
         for name in ("wallpaper.png", "wallpaper.jpg", "wallpaper.jpeg", "wallpaper.bmp"):
-            path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)))), name)
+            path = os.path.join(base, name)
             if os.path.exists(path):
                 return QPixmap(path)
         return None
@@ -433,6 +437,7 @@ class MainWindow(QWidget):
         self.web = WebClient(self.view)
         self.web.log_signal.connect(self._log)
         self.web._install_tracker()
+        self.web._install_api_observer()
         cl.addWidget(self._web_card, 7)
 
         right_panel = QWidget()
@@ -690,6 +695,16 @@ class MainWindow(QWidget):
             self._running = False
             self.start_btn.setEnabled(True)
             return
+        # 接口失效提醒：若注册表中有 failed 接口，提示用户手动操作网页供自动学习
+        try:
+            from app.engine.api_registry import ApiRegistry
+            failed = ApiRegistry().failed_endpoints()
+            if failed:
+                self._log(f"💡 检测到接口可能已变更: {', '.join(failed)}")
+                self._log("若本次下载失败，请在左侧网页手动操作一次（打开收件箱/打开邮件/下载发票），"
+                          "再点击开始下载，程序将自动学习新接口。")
+        except Exception:
+            pass
         self._log("读取勾选的邮件…")
         self._start_busy("读取勾选的邮件…")
         mails = self.web.get_selected_mails()

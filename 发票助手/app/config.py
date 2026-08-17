@@ -5,6 +5,7 @@
 
 import json
 import os
+import sys
 
 # 数据根目录（登录会话 / cookie / 凭据统一存放）
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".invoice_assistant")
@@ -21,9 +22,6 @@ PROFILE_STORAGE_DIR = os.path.join(DATA_DIR, "webengine", "storage")
 
 # 手动持久化的 cookie 文件（requests 拉取附件时复用会话）
 COOKIE_FILE = os.path.join(DATA_DIR, "web_cookies.json")
-
-# IMAP 凭据持久化文件
-CRED_FILE = os.path.join(DATA_DIR, "imap_cred.json")
 
 # QQ 邮箱首页（登录入口 + 收件箱）
 MAIL_HOME = "https://wx.mail.qq.com/home/index"
@@ -57,31 +55,14 @@ INVOICE_FROM_KEYWORDS = ("itinerary", "fapiao")
 PDF_SUFFIX = ".pdf"
 
 
-def save_imap_cred(account, auth_code):
-    """保存 IMAP 账号与授权码到用户目录。"""
-    try:
-        os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
-        with open(CRED_FILE, "w", encoding="utf-8") as f:
-            json.dump({"account": account, "auth_code": auth_code}, f, ensure_ascii=False)
-        return True
-    except Exception:
-        return False
-
-
-def load_imap_cred():
-    """读取已保存的 IMAP 账号与授权码，没有则返回 ("", "")."""
-    try:
-        with open(CRED_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        return d.get("account", ""), d.get("auth_code", "")
-    except Exception:
-        return "", ""
-
 # ---------------------------------------------------------------------------
 # 规则与 LLM 辅助配置（可在部署时自行修改）
 # ---------------------------------------------------------------------------
-# 规则文件路径（JSON）
-RULES_FILE = os.path.join(os.path.dirname(__file__), "..", "config", "invoice_rules.json")
+# 规则与 LLM 辅助配置（可在部署时自行修改）
+# ---------------------------------------------------------------------------
+# 规则文件路径（JSON）：打包后位于 _MEIPASS/config/，开发模式位于项目根/config/
+_APP_BASE = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+RULES_FILE = os.path.join(_APP_BASE, "config", "invoice_rules.json")
 # 是否启用 LLM（MIMO v2.5 free）建议功能，默认关闭（防止意外网络调用）
 ENABLE_LLM_SUGGESTION = True
 

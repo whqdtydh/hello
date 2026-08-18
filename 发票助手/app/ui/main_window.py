@@ -685,6 +685,7 @@ class MainWindow(QWidget):
             self._fill_mail_table(mapping)
             self._log(f"✅ 邮件列表加载完成：共 {len(mapping)} 封")
             self._set_status(f"列表 {len(mapping)} 封", "ready")
+            self._left_tabs.setCurrentIndex(0)  # 刷新成功自动切回邮件列表页签
         except Exception as e:
             self._log(f"❌ 拉取邮件列表失败: {str(e)[:100]}")
             self._set_status("拉取失败", "error")
@@ -935,9 +936,14 @@ class MainWindow(QWidget):
         self._start_busy("读取勾选的邮件…")
         mails = self._collect_selected_mails()
         if not mails:
+            # 列表未加载或未勾选 → 自动尝试刷新列表后再收集
+            self._log("邮件列表为空，自动拉取最新邮件列表…")
+            self.on_refresh_list()
+            mails = self._collect_selected_mails()
+        if not mails:
             self._stop_busy()
             self._set_status("无勾选邮件", "error")
-            QMessageBox.warning(self, "提示", "没有勾选邮件。请先在「邮件列表」页签点「刷新列表」加载邮件并勾选。")
+            QMessageBox.warning(self, "提示", "没有勾选邮件。请先在「邮件列表」页签刷新列表，勾选要下载的邮件后重试。")
             self._running = False
             self.start_btn.setEnabled(True)
             return

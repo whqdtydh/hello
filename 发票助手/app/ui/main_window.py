@@ -15,14 +15,14 @@ import time
 import html
 
 from PySide6.QtCore import Qt, Signal, QTimer, QRect, QSize, QPoint
-from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QPixmap, QFont, QCursor
+from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QPixmap, QFont, QCursor, QBrush
 from PySide6.QtWebEngineCore import QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog,
     QTextEdit, QMessageBox, QTableWidget, QHeaderView,
-    QCheckBox, QTableWidgetItem, QTabWidget,
+    QCheckBox, QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem,
 )
 
 from app import config
@@ -218,7 +218,7 @@ class _FloatingButtons(QWidget):
 # ═══════════════════════════════════════════════════════════════
 
 class MainWindow(QWidget):
-    log_signal = Signal(str)
+    log_signal = Signal(str, str)   # (msg, group)：group 为空表示全局日志
     progress_signal = Signal(int, int, int)
     done_signal = Signal(object)
     error_signal = Signal(str)
@@ -438,7 +438,7 @@ class MainWindow(QWidget):
         # 渲染进程崩溃监控：记录崩溃原因与退出码，便于诊断闪退
         self.view.page().renderProcessTerminated.connect(self._on_render_crashed)
         self.web = WebClient(self.view)
-        self.web.log_signal.connect(self._log)
+        self.web.log_signal.connect(lambda m: self._log(m, ""))
         self.web._install_tracker()
         wc_lay.addWidget(self.view, 1)
         cl.addWidget(self._web_card, 7)
@@ -615,7 +615,7 @@ class MainWindow(QWidget):
         v.addLayout(prog_row)
         self._prog_bar = _ProgressBar()
         v.addWidget(self._prog_bar)
-        self.start_btn = QPushButton("▶ 开始下载")
+        self.start_btn = QPushButton("开始下载")
         self.start_btn.setMinimumHeight(36)
         self.start_btn.setStyleSheet(
             "QPushButton { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #2D5A8E,stop:1 #1E3A5F); "
@@ -629,7 +629,7 @@ class MainWindow(QWidget):
         return card
 
     def _build_log_card(self):
-        card, v = self._card("运行日志")
+        card, v = self._card("下载结果")
         self.status_label = QLabel("未连接")
         self.status_label.setStyleSheet("font-size: 11px; color: #1F2937; background: transparent;")
         self.status_dot = QLabel()
@@ -641,28 +641,46 @@ class MainWindow(QWidget):
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
         v.addLayout(status_row)
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("Cascadia Mono", 11))
-        self.log_view.setStyleSheet(
-            "background: rgba(255,255,255,0.40); border: 1px solid rgba(200,210,220,0.30); "
-            "padding: 8px 10px; color: #111827; "
-            "font-family: 'Cascadia Mono', monospace; font-size: 11px; "
-            "selection-background-color: #1E3A5F; selection-color: white;")
-        v.addWidget(self.log_view, 1)
+        # 结果树：每封勾选邮件一个分组（标题=结论），展开看详情
+        self.result_tree = QTreeWidget()
+        self.result_tree.setHeaderHidden(True)
+        self.result_tree.setIndentation(14)
+        self.result_tree.setStyleSheet(
+            "QTreeWidget { background: rgba(255,255,255,0.40); border: 1px solid rgba(200,210,220,0.30); "
+            "border-radius: 8px; color: #111827; font-size: 12px; }"
+            "QTreeWidget::item { padding: 3px 4px; }"
+            "QTreeWidget::item:selected { background: rgba(30,58,95,0.12); color: #111827; }")
+        v.addWidget(self.result_tree, 1)
+        self._tree_map = {}   # group → QTreeWidgetItem
         return card
 
-    _LOG_COLORS = {"✓": "#059669", "✗": "#DC2626", "⚠": "#D97706", "▶": "#1E3A5F", "🏁": "#7C3AED", "↓": "#0284C7"}
-
-    def _log(self, msg):
-        ts = time.strftime("%H:%M:%S")
-        color = "#111827"
-        for prefix, c in self._LOG_COLORS.items():
-            if msg.startswith(prefix):
-                color = c
-                break
-        self.log_view.append(f'<font color="#374151">[{ts}]</font> <font color="{color}">{html.escape(msg)}</font>')
-        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+    def _log(self, msg, group=""):
+        if not group:
+            group = "__global__"  # 全局日志归入「系统」组
+        top = self._tree_map.get(group)
+        if top is None:
+            top = QTreeWidgetItem([msg])
+            self._tree_map[group] = top
+            self.result_tree.addTopLevelItem(top)
+            top.setForeground(0, QBrush(QColor("#6B7280")))
+            top.setExpanded(True)
+            return
+        if msg.startswith("[处理]"):
+            top.setText(0, msg[len("[处理]"):].strip())
+            top.setForeground(0, QBrush(QColor("#1E3A5F")))
+            top.setExpanded(True)
+        elif msg.startswith("[成功]"):
+            detail = msg[len("[成功]"):].strip()
+            top.setText(0, f"✓ {top.text(0)}  {detail}")
+            top.setForeground(0, QBrush(QColor("#059669")))
+            top.addChild(QTreeWidgetItem([detail]))
+        elif msg.startswith("[失败]"):
+            detail = msg[len("[失败]"):].strip()
+            top.setText(0, f"✗ {top.text(0)}  {detail}")
+            top.setForeground(0, QBrush(QColor("#DC2626")))
+            top.addChild(QTreeWidgetItem([detail]))
+        else:
+            top.addChild(QTreeWidgetItem([msg]))
 
     def _progress_slot(self, processed, total, downloaded):
         self._set_status(f"下载中 {processed}/{total} · {downloaded} 个 PDF", "busy")
@@ -714,9 +732,9 @@ class MainWindow(QWidget):
         self._log("正在清除登录凭证，准备更换 QQ 邮箱…")
         try:
             self.web.cookies.clear_all()
-            self._log("✅ 已清除登录凭证，正在打开登录页…")
+            self._log("已清除登录凭证，正在打开登录页…")
         except Exception as e:
-            self._log(f"⚠ 清除凭证失败: {str(e)[:60]}")
+            self._log(f"清除凭证失败: {str(e)[:60]}")
         self.web.navigate(config.MAIL_HOME)
         self._log(f"已打开：{config.MAIL_HOME}")
 
@@ -732,7 +750,7 @@ class MainWindow(QWidget):
             self._start_impl()
         except Exception as e:
             self._stop_busy()
-            self._log("❌ " + str(e))
+            self._log("" + str(e))
             self._running = False
             self.start_btn.setEnabled(True)
 
@@ -748,7 +766,7 @@ class MainWindow(QWidget):
             from app.engine.api_registry import ApiRegistry
             failed = ApiRegistry().failed_endpoints()
             if failed:
-                self._log(f"💡 检测到接口可能已变更: {', '.join(failed)}")
+                self._log(f"检测到接口可能已变更: {', '.join(failed)}")
                 self._log("若本次下载失败，请在左侧网页手动操作一次（打开收件箱/打开邮件/下载发票），"
                           "再点击开始下载，程序将自动学习新接口。")
         except Exception:
@@ -789,7 +807,7 @@ class MainWindow(QWidget):
             files = ctrl.run(mails, sid=sid)
             self.done_signal.emit(files)
         except Exception as e:
-            self.log_signal.emit("❌ " + str(e))
+            self.log_signal.emit("失败 " + str(e), "")
             self.done_signal.emit([])
             self.error_signal.emit(str(e))
 

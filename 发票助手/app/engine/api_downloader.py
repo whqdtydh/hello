@@ -14,8 +14,10 @@
 import json
 import os
 import re
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -322,13 +324,13 @@ class QQMailApi:
             r = self.session.get(url, timeout=20)
             r.raise_for_status()
         except Exception as e:
-            self.on_log(f"⚠ maillist 请求异常: {str(e)[:60]}")
+            self.on_log(f"maillist 请求异常: {str(e)[:60]}")
             self._mark_failed("maillist")
             return []
         j = r.json()
         head = j.get("head", {})
         if head.get("ret") != 0:
-            self.on_log(f"⚠ maillist ret={head.get('ret')} msg={head.get('msg','')[:60]}")
+            self.on_log(f"maillist ret={head.get('ret')} msg={head.get('msg','')[:60]}")
             self._mark_failed("maillist")
             return []
         return j.get("body", {}).get("list", []) or []
@@ -355,28 +357,29 @@ class QQMailApi:
             r = self.session.post(url, data={"mailid": mailid, "func": func}, timeout=20)
             r.raise_for_status()
         except Exception as e:
-            self.on_log(f"⚠ readmail 请求异常: {str(e)[:60]}")
+            self.on_log(f"readmail 请求异常: {str(e)[:60]}")
             self._mark_failed("readmail")
             return {}
         j = r.json()
         head = j.get("head", {})
         if head.get("ret") != 0:
-            self.on_log(f"⚠ readmail ret={head.get('ret')} msg={head.get('msg','')[:60]}")
+            self.on_log(f"readmail ret={head.get('ret')} msg={head.get('msg','')[:60]}")
             self._mark_failed("readmail")
             return {}
         item = j.get("body", {}).get("item", {}) or {}
         if str(item.get("ret", "0")) != "0":
-            self.on_log(f"⚠ readmail item.ret={item.get('ret')}")
+            self.on_log(f"readmail item.ret={item.get('ret')}")
             self._mark_failed("readmail")
             return {}
         return item
 
-    def download_attach(self, download_url, dest_path):
-        """附件型：download_url 形如 /attach/download?mailid=..&fileid=..&name=.."""
+    def download_attach(self, download_url, dest_path, session=None):
+        """附件型：download_url 形如 /attach/download?mailid=..&fileid=..&name=..
+        session 可选：并发下载时传入独立会话，避免共享 Session 线程竞争。"""
         url = download_url
         if url.startswith("/"):
             url = self._url(url)
-        return self._download(url, dest_path)
+        return self._download(url, dest_path, session=session)
 
     def download_fapiao(self, no, code, name, dest_path):
         """已知发票号码：/fapiao/download?fapiao_list={"fapiao":[{"no","code"}]}"""
@@ -418,27 +421,28 @@ class QQMailApi:
                 m_sig2 = re.search(r"signatureString\s*[:=]\s*['\"]([^'\"]+)['\"]", r.text)
                 if m_sig2:
                     sig = m_sig2.group(1)
-            self.on_log(f"    51fapiao 直接下载失败，回退 sig 流程: signatureString={'✓' if sig else '✗(空)'} dlj={dlj}")
+            self.on_log(f"    51fapiao 直接下载失败，回退 sig 流程: signatureString={'✓' if sig else '(空)'} dlj={dlj}")
             if not sig:
                 return False
             perm_url = f"{base}/dlj/v7/checkDownloadPermissions/getFile/{dlj}/{sig}"
             r2 = requests.get(perm_url, headers=h, timeout=15)
             if r2.text.strip() != "success":
-                self.on_log(f"⚠ 51fapiao 权限检查失败: {r2.text[:80]}")
+                self.on_log(f"51fapiao 权限检查失败: {r2.text[:80]}")
                 return False
             dl_url = f"{base}/dlj/v7/downloadFile/{dlj}?signatureString={sig}"
             return self._download(dl_url, dest_path, extra_headers=h)
         except Exception as e:
-            self.on_log(f"⚠ 51fapiao 下载异常: {str(e)[:80]}")
+            self.on_log(f"51fapiao 下载异常: {str(e)[:80]}")
             return False
 
-    def _download(self, url, dest_path, extra_headers=None):
-        """下载 URL 内容到 dest_path。返回 True/False。"""
+    def _download(self, url, dest_path, extra_headers=None, session=None):
+        """下载 URL 内容到 dest_path。返回 True/False。session 可选（并发时用独立会话）。"""
         try:
-            headers = dict(self.session.headers)
+            s = session or self.session
+            headers = dict(s.headers)
             if extra_headers:
                 headers.update(extra_headers)
-            with self.session.get(url, headers=headers, stream=True, timeout=60) as r:
+            with s.get(url, headers=headers, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
                 with open(dest_path, "wb") as f:
@@ -447,7 +451,7 @@ class QQMailApi:
             grant_current_user_access(dest_path)
             return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
         except Exception as e:
-            self.on_log(f"⚠ 下载失败 {os.path.basename(dest_path)}: {str(e)[:80]}")
+            self.on_log(f"警告 下载失败 {os.path.basename(dest_path)}: {str(e)[:80]}")
             return False
 
 
@@ -465,7 +469,7 @@ class ApiDownloadController:
     def __init__(self, client: WebClient, save_dir, on_log=None, on_progress=None):
         self.client = client
         self.save_dir = save_dir
-        self.on_log = on_log or (lambda m: None)
+        self.on_log = on_log or (lambda m, g="": None)
         self.on_progress = on_progress or (lambda p, t, d: None)
         self.registry = ApiRegistry()
 
@@ -474,9 +478,18 @@ class ApiDownloadController:
         self.stop_flag = False
         self._last_51_ok = False
         self._total_amount = 0.0
+        self._lock = threading.Lock()          # 保护共享计数（并发下载）
+        self._cache_lock = threading.Lock()    # 保护 maillist 缓存
+        self._cache_done = threading.Event()   # 列表拉取完成标记（边拉边处理）
+        self._max_pages = 40
+        self._cur_group = ""                   # 当前处理邮件的日志分组
+        self._processed_count = 0
 
     def log(self, msg):
-        self.on_log(msg)
+        try:
+            self.on_log(msg, self._cur_group)
+        except TypeError:
+            self.on_log(msg)
 
     def _maybe_learn_api(self):
         """运行前检查：若有 failed 接口，从观察记录学习新接口路径。
@@ -487,7 +500,7 @@ class ApiDownloadController:
         failed = self.registry.failed_endpoints()
         if not failed:
             return []
-        self.log(f"🔁 检测到 {len(failed)} 个接口可能已变更: {', '.join(failed)}，尝试从网页观察记录学习…")
+        self.log(f"检测到 {len(failed)} 个接口可能已变更: {', '.join(failed)}，尝试从网页观察记录学习…")
         observations = self.client.get_observed_requests()
         if not observations:
             self.log("  暂无网页请求记录。请在左侧网页中手动操作一次"
@@ -501,7 +514,7 @@ class ApiDownloadController:
         updated = self.registry.learn_from_observations(observations)
         if updated:
             self.registry.clear_failed()
-            self.log(f"✅ 已学习到新接口: {', '.join(updated)}，本次将使用新接口重试")
+            self.log(f"已学习到新接口: {', '.join(updated)}，本次将使用新接口重试")
         else:
             self.log("  观察记录未能匹配到新接口（可能页面未产生同类请求）。"
                      "请手动操作一次后再试。")
@@ -516,21 +529,35 @@ class ApiDownloadController:
 
     def run(self, selected_mails, sid=None):
         """selected_mails: 用户勾选的邮件 [{mailid, subject, sender, text}]
-        sid: 可选，GUI 线程已取好的会话 sid。"""
+        sid: 可选，GUI 线程已取好的会话 sid。
+        多封邮件并发处理（2 worker），附件内部再并行下载（4 worker）。"""
         os.makedirs(self.save_dir, exist_ok=True)
         if not selected_mails:
-            self.log("没有检测到勾选的邮件。请先在左侧网页中勾选需要下载的邮件。")
+            self.log("没有检测到勾选的邮件。")
             return []
         # 接口失效学习：运行前检查 failed 接口，尝试从网页观察记录更新路径
         self._maybe_learn_api()
         self.prepare(selected_mails, sid=sid)
-        while self.process_next():
-            pass
-        self.log(f"🏁 全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mail") as pool:
+            futures = [pool.submit(self._safe_process_one, m, i)
+                       for i, m in enumerate(selected_mails)]
+            for f in futures:
+                f.result()
+        self.log(f"全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
         # 简单总结：读取到的邮件数量 + 下载的文件数量
-        self.log(f"📋 本次总结：读取邮件 {len(selected_mails)} 封，下载文件 {len(self.downloaded_files)} 个")
+        self.log(f"本次总结：读取邮件 {len(selected_mails)} 封，下载文件 {len(self.downloaded_files)} 个")
         self._archive_by_amount()
         return self.downloaded_files
+
+    def _safe_process_one(self, m, i):
+        try:
+            self._process_one(m, i)
+        except Exception as e:
+            self.log(f"  处理异常: {str(e)[:80]}")
+        finally:
+            with self._lock:
+                self._processed_count += 1
+                self.on_progress(self._processed_count, self._total, self.downloaded_pdf_count)
 
     def _archive_by_amount(self):
         """下载完成后按合计金额归档：建「xx.xx元」子文件夹，把已下载 PDF 移入。"""
@@ -553,7 +580,8 @@ class ApiDownloadController:
         self.log(f"  已新建文件夹「{os.path.basename(sub)}」，移入 {moved} 个 PDF")
 
     def prepare(self, selected_mails, sid=None):
-        """初始化处理队列。必须在 GUI 线程调用（读取 cookie）。sid 可选（GUI 线程已取好）。"""
+        """初始化处理队列。必须在 GUI 线程调用（读取 cookie）。sid 可选（GUI 线程已取好）。
+        边拉边处理：先同步拉前 2 页即可开始处理，后台线程继续拉剩余页填缓存。"""
         os.makedirs(self.save_dir, exist_ok=True)
         self._mails = selected_mails
         self._i = 0
@@ -561,15 +589,46 @@ class ApiDownloadController:
         self._api = self._build_api(sid=sid)
         # 预拉全量 maillist，建立 emailid → item 映射（含附件 download_url）
         self._mail_cache = {}
+        self._cache_done = threading.Event()
         try:
             self.log("拉取邮件列表建立附件映射…")
-            self._mail_cache = self._api.fetch_maillist_all(max_pages=40)
-            self.log(f"  maillist 缓存 {len(self._mail_cache)} 封")
+            for page in range(2):
+                lst = self._api.fetch_maillist(page_now=page, page_size=50)
+                if not lst:
+                    self._cache_done.set()
+                    break
+                self._merge_cache(lst)
+                if len(lst) < 50:
+                    self._cache_done.set()
+                    break
         except Exception as e:
-            self.log(f"  ⚠ 拉取邮件列表失败: {str(e)[:60]}（将逐封查询）")
+            self.log(f"  警告 拉取邮件列表失败: {str(e)[:60]}（将逐封查询）")
+            self._cache_done.set()
+        if not self._cache_done.is_set():
+            def _fetch_rest():
+                try:
+                    for page in range(2, self._max_pages):
+                        lst = self._api.fetch_maillist(page_now=page, page_size=50)
+                        if not lst:
+                            break
+                        self._merge_cache(lst)
+                        if len(lst) < 50:
+                            break
+                except Exception:
+                    pass
+                finally:
+                    self._cache_done.set()
+                    with self._cache_lock:
+                        n = len(self._mail_cache)
+                    self.log(f"  邮件列表缓存 {n} 封")
+            threading.Thread(target=_fetch_rest, daemon=True).start()
+        else:
+            with self._cache_lock:
+                n = len(self._mail_cache)
+            self.log(f"  邮件列表缓存 {n} 封")
         # 若存在 failed 接口，开启网页观察并提示用户手动操作（供下次学习）
         if self.registry.failed_endpoints():
-            self.log("  💡 接口失效：请手动在左侧网页操作一次（打开收件箱/打开邮件/下载发票），"
+            self.log("  提示 接口失效：请手动在左侧网页操作一次（打开收件箱/打开邮件/下载发票），"
                      "程序会自动记录并学习新接口，下次下载将自动使用新接口。")
             try:
                 self.client.start_api_observe()
@@ -577,38 +636,38 @@ class ApiDownloadController:
                 pass
         self.log(f"检测到勾选 {self._total} 封邮件，开始处理…")
 
-    def process_next(self):
-        """在 GUI 线程处理下一封邮件。返回 True 表示还有更多待处理。"""
-        if self.stop_flag:
-            self.log("已手动停止。")
-            return False
-        if self._i >= self._total:
-            return False
-        i = self._i
-        m = self._mails[i]
-        self._i += 1
-        self._process_one(m, i)
-        return self._i < self._total
+    def _merge_cache(self, lst):
+        with self._cache_lock:
+            for it in lst:
+                eid = it.get("emailid") or it.get("mailid") or ""
+                if eid:
+                    self._mail_cache[eid] = it
 
     def _process_one(self, m, processed):
-        """处理单封邮件：按类型下载。若本封未成功下载任何文件，建失败标记文件夹。"""
+        """处理单封邮件：按类型下载。若本封未成功下载任何文件，建失败标记文件夹。
+        并发安全：共享计数通过 self._lock 保护。"""
         mailid = m.get("mailid", "")
         subject = m.get("subject", "") or m.get("text", "")[:60]
         text = m.get("text", "") or subject
         sender = m.get("sender", "") or m.get("from", "") or ""
+        self._cur_group = f"mail_{processed}"
+        self.log(f"[处理] {subject[:40]}")
 
         if not is_invoice_mail(text):
-            self.log(f"⏭ 跳过非发票邮件: {subject[:40]}")
+            self.log(f"  跳过非发票邮件: {subject[:40]}")
+            self._cur_group = ""
             return
 
-        before = self.downloaded_pdf_count
+        with self._lock:
+            before = self.downloaded_pdf_count
         date_str = ""
-        self.log(f"▶ 处理发票邮件: {subject[:50]}…")
+        self.log(f"[详情] {subject[:50]}…")
         try:
             # 1) 先拉详情（readmail func=1 拿正文 + 附件信息）
             item = self._api.fetch_readmail(mailid, func=1)
             if not item:
-                self.log("    详情获取失败")
+                self.log("  详情获取失败")
+                self._cur_group = ""
                 return
             content = item.get("content", "") or ""
             info = item.get("info", {}) or {}
@@ -619,20 +678,17 @@ class ApiDownloadController:
             plain = re.sub(r"<[^>]+>", " ", content)
             consume = consume_date(plain) or consume_date(text)
             date_str = consume or email_date
-            if consume:
-                self.log(f"    📅 消费日期: {consume} (邮件日期: {email_date})")
-            else:
-                self.log(f"    📅 邮件日期: {email_date} (未提取到消费日期)")
 
             # 2) 附件型：readmail 返回里没有附件，需从 maillist 拿
-            #    先尝试从 maillist 缓存/拉取附件信息
             attach_urls = self._get_attach_urls(mailid)
             if attach_urls:
                 mail_amounts = self._download_attaches(attach_urls, subject, date_str, text, sender)
-                if self.downloaded_pdf_count > before:
+                with self._lock:
+                    now_count = self.downloaded_pdf_count
+                if now_count > before:
                     # 按金额去重累加（发票+行程单同金额只算一次）
                     self._total_amount += sum(mail_amounts)
-                self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+                self._cur_group = ""
                 return
 
             # 3) 链接型：51fapiao / alipay
@@ -640,66 +696,86 @@ class ApiDownloadController:
             if dlj_links:
                 amounts = self._download_51fapiao_links(dlj_links, subject, date_str, text, sender)
                 # 诊断：下载失败时输出正文中 51fapiao 相关片段，便于定位链接截断
-                if self.downloaded_pdf_count == 0 and not self._last_51_ok:
+                with self._lock:
+                    now_count = self.downloaded_pdf_count
+                if now_count == 0 and not self._last_51_ok:
                     self._dump_51fapiao_context(content)
-                if self.downloaded_pdf_count > before:
+                if now_count > before:
                     self._total_amount += sum(amounts)
-                self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+                self._cur_group = ""
                 return
 
             alipay_links = extract_alipay_links(content)
             if alipay_links:
                 amounts = self._download_alipay_links(alipay_links, subject, date_str, text, sender)
-                if self.downloaded_pdf_count > before:
+                with self._lock:
+                    now_count = self.downloaded_pdf_count
+                if now_count > before:
                     self._total_amount += sum(amounts)
-                self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+                self._cur_group = ""
                 return
 
             # 3.5) 阿里云 OSS 商家发票图片（淘宝闪购等平台）
             oss_links = extract_oss_links(content)
             if oss_links:
                 amounts = self._download_oss_links(oss_links, subject, date_str, text, sender)
-                if self.downloaded_pdf_count > before:
+                with self._lock:
+                    now_count = self.downloaded_pdf_count
+                if now_count > before:
                     self._total_amount += sum(amounts)
-                self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+                self._cur_group = ""
                 return
 
             # 4) 已知发票号码：fapiao/download
             no = extract_invoice_no(subject)
             if no:
-                self.log(f"    尝试按发票号码下载: {no}")
+                self.log(f"  尝试按发票号码下载: {no}")
                 kind = invoice_kind(subj=subject, body=text, sender=sender)
                 fname = build_filename(kind, subject, date_str, msg=text)
                 dest = unique_path(self.save_dir, fname)
                 if self._api.download_fapiao(no, "", fname, dest):
                     self.report_downloaded(dest)
-                self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+                self._cur_group = ""
                 return
 
-            self.log("    未找到附件/链接/发票号码，跳过")
+            self.log("  未找到附件/链接/发票号码，跳过")
         except Exception as e:
-            self.log(f"    ✗ 处理异常: {str(e)[:80]}")
+            self.log(f"  处理异常: {str(e)[:80]}")
         finally:
-            # 本封邮件未成功下载任何文件 → 建失败标记文件夹（文件夹名承载邮件信息）
-            if self.downloaded_pdf_count == before:
+            with self._lock:
+                now_count = self.downloaded_pdf_count
+            if now_count == before:
+                # 本封邮件未成功下载任何文件 → 建失败标记文件夹（文件夹名承载邮件信息）
                 self._mark_failed(subject, date_str, sender)
-            self.on_progress(processed + 1, self._total, self.downloaded_pdf_count)
+                self.log("[失败] 未下载到文件")
+            else:
+                self.log(f"[成功] 下载文件 {now_count - before} 个")
+            self._cur_group = ""
 
     def _mark_failed(self, subject, date_str, sender):
         """下载失败：建一个空文件夹，文件夹名 = 邮件简短信息。"""
         try:
             folder = unique_dir(self.save_dir, failed_folder_name(subject, date_str, sender))
             os.makedirs(folder, exist_ok=True)
-            self.log(f"    ⚠ 未下载成功，已建标记文件夹：{os.path.basename(folder)}")
+            self.log(f"    未下载成功，已建标记文件夹：{os.path.basename(folder)}")
         except Exception as e:
-            self.log(f"    ⚠ 建失败标记文件夹异常: {str(e)[:60]}")
+            self.log(f"    建失败标记文件夹异常: {str(e)[:60]}")
 
     def _get_attach_urls(self, mailid):
-        """从 maillist 缓存获取邮件的附件下载 URL 列表。"""
-        it = self._mail_cache.get(mailid)
+        """从 maillist 缓存获取邮件的附件下载 URL 列表。
+        边拉边处理：缓存未命中时等待拉取线程（最多 15 秒），超时后逐页单查。"""
+        it = self._cache_get(mailid)
         if it:
             return [a.get("download_url", "") for a in it.get("normal_attach", []) or [] if a.get("download_url")]
-        # 缓存未命中：逐页查询
+        # 缓存未命中且列表还在拉取：轮询等待（最多 15 秒）
+        waited = 0
+        while not self._cache_done.is_set() and waited < 15000:
+            time.sleep(0.2)
+            waited += 200
+            it = self._cache_get(mailid)
+            if it:
+                return [a.get("download_url", "") for a in it.get("normal_attach", []) or [] if a.get("download_url")]
+        # 拉取完成仍未命中：逐页单查
         try:
             for page in range(5):
                 lst = self._api.fetch_maillist(page_now=page, page_size=50)
@@ -709,17 +785,43 @@ class ApiDownloadController:
                 if len(lst) < 50:
                     break
         except Exception as e:
-            self.log(f"    ⚠ 拉取附件信息失败: {str(e)[:60]}")
+            self.log(f"  警告 拉取附件信息失败: {str(e)[:60]}")
         return []
+
+    def _cache_get(self, mailid):
+        with self._cache_lock:
+            return self._mail_cache.get(mailid)
+
+    def _new_session(self):
+        """为并发下载创建独立 requests 会话（共享 cookie，避免 Session 线程竞争）。"""
+        s = requests.Session()
+        s.cookies = self._api.cookies
+        s.headers.update(dict(self._api.session.headers))
+        return s
+
+    def _append_pending_date_check(self, shared_date, email_date, temp_pdfs):
+        """兜底日期（来自邮件日期）时，把文件名记入待确认列表，提示用户核对。"""
+        if shared_date == email_date or shared_date is None:
+            try:
+                pending = os.path.join(self.save_dir, "待确认日期.txt")
+                mode = "a" if os.path.exists(pending) else "w"
+                with open(pending, "a", encoding="utf-8") as f:
+                    if mode == "w":
+                        f.write("以下文件命名日期来自邮件日期，可能不是消费当天，请核对后手动改名：\n\n")
+                    for tmp_path, kind, orig_name in temp_pdfs:
+                        f.write(f"  {os.path.basename(tmp_path)}  ({kind})\n")
+            except Exception:
+                pass
 
     def _download_attaches(self, attach_urls, subject, date_str, text, sender=""):
         """下载附件型发票（PDF/zip）。zip 附件解压后提取 PDF。
 
         两阶段策略：
-        1. 先下载所有 PDF 到临时目录，提取消费日期，确定共享日期
+        1. 并行下载所有 PDF 到临时目录（4 worker），提取消费日期，确定共享日期
         2. 再用共享日期统一命名保存
 
-        这样行程单先提取到消费日期后，发票也能用正确的日期命名。
+        日期优先级（行程单优先）：行程单票面日期（= 消费当天，最准）
+        > 其他 PDF 票面日期（高速发票票面有通行时间）> 正文日期 > 邮件日期。
         """
         import tempfile, shutil
 
@@ -733,18 +835,17 @@ class ApiDownloadController:
                 seen_names.add(key)
                 unique_urls.append(u)
         if len(unique_urls) < len(attach_urls):
-            self.log(f"    🔗 去重: {len(attach_urls)} → {len(unique_urls)} 个附件")
+            self.log(f"  去重: {len(attach_urls)} → {len(unique_urls)} 个附件")
         attach_urls = unique_urls
 
-        # ---- 阶段1：下载到临时目录，提取消费日期 ----
+        # ---- 阶段1：并发下载到临时目录 ----
         tmp_dir = tempfile.mkdtemp(prefix="fapiao_")
         temp_pdfs = []  # [(临时路径, kind, 原始文件名)]
-        shared_date = date_str
-        self.log(f"    🔗 附件URL {len(attach_urls)} 个")
+        self.log(f"  附件 {len(attach_urls)} 个，并行下载…")
 
-        for u in attach_urls:
+        def _dl_one(u):
             if self.stop_flag:
-                break
+                return None
             name = ""
             m = re.search(r"name=([^&]+)", u)
             if m:
@@ -754,18 +855,27 @@ class ApiDownloadController:
                     name = m.group(1)
             suffix = os.path.splitext(name)[1].lower() if name else ".pdf"
             if suffix not in (".pdf", ".zip"):
-                continue
+                return None
             kind = invoice_kind(subj=subject, att_name=name, body=text, sender=sender)
             tmp_path = os.path.join(tmp_dir, name or f"tmp_{len(temp_pdfs)}.pdf")
-            self.log(f"    ↓ 下载 {name or '附件'}…")
-            if not self._api.download_attach(u, tmp_path):
-                self.log(f"    ✗ 下载失败 {name}")
-                continue
-            # 验证下载结果
+            self.log(f"  下载 {name or '附件'}…")
+            if not self._api.download_attach(u, tmp_path, session=self._new_session()):
+                self.log(f"  下载失败 {name}")
+                return None
             dl_ok = os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0
-            self.log(f"    ↓ 写入 {os.path.basename(tmp_path)} ok={dl_ok} size={os.path.getsize(tmp_path) if dl_ok else 0}")
+            self.log(f"  写入 {os.path.basename(tmp_path)} ok={dl_ok} size={os.path.getsize(tmp_path) if dl_ok else 0}")
+            return (tmp_path, kind, name)
+
+        results = []
+        if attach_urls:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="att") as ex:
+                results = list(ex.map(_dl_one, attach_urls))
+        for res in results:
+            if not res:
+                continue
+            tmp_path, kind, name = res
             if self._is_zip(tmp_path):
-                self.log(f"    ↦ 解压 PDF…")
+                self.log("  解压 PDF…")
                 amount_hint = f"{extract_amount_from_text(name):.2f}元" if extract_amount_from_text(name) else ""
                 extracted = self._extract_pdfs_from_zip(tmp_path, tmp_dir, kind, date_str, amount_hint=amount_hint)
                 try:
@@ -777,61 +887,69 @@ class ApiDownloadController:
             else:
                 temp_pdfs.append((tmp_path, kind, name))
 
-        # ---- 阶段1.5：提取消费日期 + 用 PDF 票面识别修正发票类型 ----
+        # ---- 阶段1.5：提取消费日期（行程单优先）+ 用 PDF 票面识别修正发票类型 ----
         rail_infos = {}  # tmp_path → railway_info（高铁 PDF 专用）
         pdf_kinds = {}  # tmp_path → kind_from_pdf 修正后的类型
-        self.log(f"    📋 临时文件 {len(temp_pdfs)} 个")
+        itinerary_dates = []  # 行程单票面日期（消费当天，最准）
+        pdf_dates = {}  # tmp_path → 票面日期
+        self.log(f"  临时文件 {len(temp_pdfs)} 个")
         for tmp_path, kind, orig_name in temp_pdfs:
             exists = os.path.exists(tmp_path)
             sz = os.path.getsize(tmp_path) if exists else 0
-            self.log(f"    🔍 [{kind}] {orig_name} → {tmp_path} exists={exists} size={sz}")
+            self.log(f"  [{kind}] {orig_name} size={sz}")
             if tmp_path.lower().endswith(".pdf") and exists:
                 pdf_text = self._pdf_text(tmp_path)
                 # 票面类型识别（铁路/航空/通行费/餐饮等），覆盖邮件关键词粗判
                 pdf_kind = kind_from_pdf(pdf_text) if pdf_text else ""
                 if pdf_kind and pdf_kind != kind:
-                    self.log(f"    🏷 票面识别: {kind} → {pdf_kind}（依据 PDF 项目名称）")
+                    self.log(f"  票面识别: {kind} → {pdf_kind}（依据 PDF 项目名称）")
                     kind = pdf_kind
                     pdf_kinds[tmp_path] = pdf_kind
+                d = ""
                 # 高铁发票：优先从 PDF 提取乘车日期/票价（邮件正文常含订单号干扰）
                 if "高铁" in kind or "铁路" in kind:
                     rw = self._railway_info_from_pdf(tmp_path)
                     if rw.get("date") or rw.get("amount"):
                         rail_infos[tmp_path] = rw
                         d = rw.get("date") or ""
-                        self.log(f"    🚄 铁路客票PDF: 乘车={d or '?'} 票价={rw.get('amount') or 0}")
-                        if d and (not shared_date or d < shared_date):
-                            shared_date = d
-                        continue  # PDF 信息优先，跳过通用正则
-                d = self._consume_date_from_file(tmp_path)
-                self.log(f"    🔍 consume_date result={d!r}")
+                        self.log(f"  铁路客票PDF: 乘车={d or '?'} 票价={rw.get('amount') or 0}")
+                if not d:
+                    d = self._consume_date_from_file(tmp_path)
+                    self.log(f"  票面日期 result={d!r}")
                 if d:
-                    # 消费日期通常 ≤ 开票日期，取最早的
-                    if not shared_date or d < shared_date:
-                        shared_date = d
+                    pdf_dates[tmp_path] = d
+                    if "行程单" in kind:
+                        itinerary_dates.append(d)
 
-        if shared_date != date_str:
-            self.log(f"    📅 共享消费日期: {shared_date} (原邮件日期: {date_str})")
+        # 行程单优先：行程单票面日期 = 消费当天（发票开票日期可能不等于消费日）
+        if itinerary_dates:
+            shared_date = min(itinerary_dates)
+            self.log(f"  消费日期: {shared_date}（行程单票面）")
+        elif pdf_dates:
+            shared_date = min(pdf_dates.values())
+            self.log(f"  消费日期: {shared_date}（PDF 票面）")
         else:
-            self.log(f"    📅 使用邮件日期: {date_str}")
+            shared_date = date_str
+            self.log(f"  警告 命名日期来自邮件日期: {date_str}，可能不是消费当天")
+        self._append_pending_date_check(shared_date, date_str, temp_pdfs)
 
         # ---- 阶段2：用共享日期命名，移动到目标目录 ----
         mail_amounts = set()
-        self.log(f"    💾 保存循环 {len(temp_pdfs)} 个文件")
+        self.log(f"  保存 {len(temp_pdfs)} 个文件")
         for tmp_path, kind, orig_name in temp_pdfs:
             if self.stop_flag:
                 break
             if not os.path.exists(tmp_path):
-                self.log(f"    💾 跳过不存在: {tmp_path}")
+                self.log(f"  跳过不存在: {tmp_path}")
                 continue
             kind = pdf_kinds.get(tmp_path, kind)  # 票面识别结果优先
             fname = build_filename(kind, orig_name, shared_date, msg=text, rw=rail_infos.get(tmp_path))
             dest = unique_path(self.save_dir, fname)
-            self.log(f"    💾 移动 {os.path.basename(tmp_path)} → {os.path.basename(dest)}")
+            self.log(f"  移动 {os.path.basename(tmp_path)} → {os.path.basename(dest)}")
             try:
                 shutil.move(tmp_path, dest)
             except Exception as e:
-                self.log(f"    💾 移动失败: {e}")
+                self.log(f"    移动失败: {e}")
                 dest = tmp_path
             grant_current_user_access(dest)
             self.report_downloaded(dest)
@@ -864,10 +982,10 @@ class ApiDownloadController:
                 data = f.read()
             d = self._consume_date_from_pdf(data)
             if not d:
-                self.log(f"    📅 PyMuPDF未提取到日期: {os.path.basename(filepath)}")
+                self.log(f"    PyMuPDF未提取到日期: {os.path.basename(filepath)}")
             return d
         except Exception as e:
-            self.log(f"    📅 读取PDF失败: {str(e)[:60]}")
+            self.log(f"    读取PDF失败: {str(e)[:60]}")
             return ""
 
     def _consume_date_from_pdf(self, data):
@@ -999,7 +1117,7 @@ class ApiDownloadController:
                         except Exception:
                             pass
         except Exception as e:
-            self.log(f"    ⚠ 解压失败: {str(e)[:80]}")
+            self.log(f"    解压失败: {str(e)[:80]}")
         return out
 
     def _download_51fapiao_links(self, links, subject, date_str, text, sender=""):
@@ -1011,13 +1129,13 @@ class ApiDownloadController:
             kind = invoice_kind(subj=subject, body=text, sender=sender)
             fname = build_filename(kind, subject, date_str, msg=text)
             dest = unique_path(self.save_dir, fname)
-            self.log(f"    ↓ 51fapiao 下载 {os.path.basename(dest)}")
+            self.log(f"    51fapiao 下载 {os.path.basename(dest)}")
             if self._api.download_51fapiao(u, dest):
                 self._last_51_ok = True
                 self.report_downloaded(dest)
                 amounts.add(extract_amount_from_text(os.path.basename(dest)))
             else:
-                self.log(f"    ✗ 51fapiao 下载失败 {u[:60]}")
+                self.log(f"    51fapiao 下载失败 {u[:60]}")
         return amounts
 
     def _dump_51fapiao_context(self, content):
@@ -1053,12 +1171,12 @@ class ApiDownloadController:
             kind = invoice_kind(subj=subject, body=text, sender=sender)
             fname = build_filename(kind, subject, date_str, msg=text)
             dest = unique_path(self.save_dir, fname)
-            self.log(f"    ↓ 支付宝发票下载 {os.path.basename(dest)}")
+            self.log(f"    支付宝发票下载 {os.path.basename(dest)}")
             if self._api.download_attach(u, dest):
                 self.report_downloaded(dest)
                 amounts.add(extract_amount_from_text(os.path.basename(dest)))
             else:
-                self.log(f"    ✗ 支付宝下载失败 {u[:60]}")
+                self.log(f"    支付宝下载失败 {u[:60]}")
         return amounts
 
     def _download_oss_links(self, links, subject, date_str, text, sender=""):
@@ -1075,17 +1193,18 @@ class ApiDownloadController:
             fname = build_filename(kind, subject, date_str, msg=text)
             base, _ = os.path.splitext(fname)
             dest = unique_path(self.save_dir, f"{base}{ext}")
-            self.log(f"    ↓ OSS 商家发票下载 {os.path.basename(dest)}")
+            self.log(f"    OSS 商家发票下载 {os.path.basename(dest)}")
             if self._api.download_attach(u, dest):
                 self.report_downloaded(dest)
                 amounts.add(extract_amount_from_text(os.path.basename(dest)))
             else:
-                self.log(f"    ✗ OSS 下载失败 {u[:60]}")
+                self.log(f"    OSS 下载失败 {u[:60]}")
         return amounts
 
     def report_downloaded(self, path):
-        if path and path not in self.downloaded_files:
-            self.downloaded_files.append(path)
-            self.downloaded_pdf_count += 1
-            self.log(f"    ✓ 已保存：{os.path.basename(path)}")
-            self.on_progress(0, 0, self.downloaded_pdf_count)
+        with self._lock:
+            if path and path not in self.downloaded_files:
+                self.downloaded_files.append(path)
+                self.downloaded_pdf_count += 1
+                self.log(f"  已保存：{os.path.basename(path)}")
+                self.on_progress(0, 0, self.downloaded_pdf_count)

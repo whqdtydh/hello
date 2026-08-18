@@ -484,6 +484,11 @@ class ApiDownloadController:
         self._max_pages = 40
         self._cur_group = ""                   # 当前处理邮件的日志分组
         self._processed_count = 0
+        # 顶部总结统计（并发线程内修改，一律加锁）
+        self._itinerary_mails = 0   # 含行程单的邮件数
+        self._failed_mails = 0      # 未下载到文件的邮件数
+        self._pending_count = 0     # 待确认日期文件数
+        self._kind_counts = {}      # 发票类型 → 张数
 
     def log(self, msg, group=""):
         try:
@@ -537,7 +542,7 @@ class ApiDownloadController:
             return []
         # 接口失效学习：运行前检查 failed 接口，尝试从网页观察记录更新路径
         self._maybe_learn_api()
-        self.log(f"检测到 {len(selected_mails)} 份邮件", "__summary__")
+        self.log(f"应下载 {len(selected_mails)} 封邮件", "__summary__")
         self.prepare(selected_mails, sid=sid)
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mail") as pool:
             futures = [pool.submit(self._safe_process_one, m, i)
@@ -545,11 +550,20 @@ class ApiDownloadController:
             for f in futures:
                 f.result()
         self.log(f"全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
-        # 顶部总结：检测邮件数 / 下载 PDF 数 / 总金额
-        self.log(
-            f"检测到 {len(selected_mails)} 份邮件，下载 {len(self.downloaded_files)} 个 PDF，"
-            f"总金额 {self._total_amount:.2f} 元（按可识别金额统计）",
-            "__summary__")
+        # 顶部总结：应下载邮件数 / 下载 PDF 数 / 总金额 / 行程单 / 失败 / 类型分布 / 待确认
+        summary = (f"应下载 {len(selected_mails)} 封邮件，下载 {len(self.downloaded_files)} 个 PDF，"
+                   f"总金额 {self._total_amount:.2f} 元")
+        if self._itinerary_mails:
+            summary += f"，含行程单 {self._itinerary_mails} 封"
+        if self._failed_mails:
+            summary += f"，失败 {self._failed_mails} 封"
+        if self._kind_counts:
+            summary += "；" + " / ".join(
+                f"{k} {v} 张" for k, v in
+                sorted(self._kind_counts.items(), key=lambda x: -x[1]))
+        if self._pending_count:
+            summary += f"，待确认日期 {self._pending_count} 个"
+        self.log(summary, "__summary__")
         self._archive_by_amount()
         return self.downloaded_files
 
@@ -752,6 +766,8 @@ class ApiDownloadController:
                 # 本封邮件未成功下载任何文件 → 建失败标记文件夹（文件夹名承载邮件信息）
                 self._mark_failed(subject, date_str, sender)
                 self.log("[失败] 未下载到文件")
+                with self._lock:
+                    self._failed_mails += 1
             else:
                 self.log(f"[成功] 下载文件 {now_count - before} 个")
             self._cur_group = ""
@@ -806,6 +822,8 @@ class ApiDownloadController:
     def _append_pending_date_check(self, shared_date, email_date, temp_pdfs):
         """兜底日期（来自邮件日期）时，把文件名记入待确认列表，提示用户核对。"""
         if shared_date == email_date or shared_date is None:
+            with self._lock:
+                self._pending_count += len(temp_pdfs)
             try:
                 pending = os.path.join(self.save_dir, "待确认日期.txt")
                 mode = "a" if os.path.exists(pending) else "w"
@@ -929,6 +947,8 @@ class ApiDownloadController:
         if itinerary_dates:
             shared_date = min(itinerary_dates)
             self.log(f"  消费日期: {shared_date}（行程单票面）")
+            with self._lock:
+                self._itinerary_mails += 1
         elif pdf_dates:
             shared_date = min(pdf_dates.values())
             self.log(f"  消费日期: {shared_date}（PDF 票面）")
@@ -963,6 +983,9 @@ class ApiDownloadController:
                 amt = extract_amount_from_text(os.path.basename(dest))
             if amt > 0:
                 mail_amounts.add(amt)
+            # 类型分布统计（顶部总结用）
+            with self._lock:
+                self._kind_counts[kind] = self._kind_counts.get(kind, 0) + 1
 
         # 清理临时目录
         try:

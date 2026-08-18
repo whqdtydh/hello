@@ -69,14 +69,27 @@ class Preloader:
     def _ensure_api(self):
         if self._api is not None:
             return
-        jar = self.client.cookies.get_cookie_jar("https://wx.mail.qq.com/")
+        # 探测登录状态：sid/cookie 为空说明还没登录，等下次轮询再试
         sid = self.client.cookies.get_cookie_value("xm_sid") or ""
-        self._api = QQMailApi(jar, sid, on_log=self.log, registry=ApiRegistry())
+        if not sid and not self.client.cookies.get_cookie_value("sid"):
+            return False
+        jar = self.client.cookies.get_cookie_jar("https://wx.mail.qq.com/")
+        self._api = QQMailApi(jar, sid, on_log=self.log,
+                              registry=ApiRegistry(memory=True))  # 内存注册表：不污染共享接口状态
+        return True
 
     def _loop(self):
+        # 0) 等登录（未登录时轮询等待，避免启动阶段误判接口失效）
+        waited = 0
+        while not self._stop.is_set() and waited < 120:
+            if self._ensure_api():
+                break
+            time.sleep(2)
+            waited += 2
+        if self._stop.is_set():
+            return
         # 1) 先预拉 maillist 全量（附件 URL 缓存），失败静默
         try:
-            self._ensure_api()
             self.log("后台预读：拉取邮件列表…")
             for page in range(40):
                 if self._stop.is_set():
@@ -103,6 +116,9 @@ class Preloader:
                     time.sleep(0.5)
                     continue
                 self._ensure_api()
+                if self._api is None:
+                    time.sleep(2)
+                    continue
                 for mailid in pending:
                     if self._stop.is_set():
                         break

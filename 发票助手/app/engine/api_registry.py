@@ -49,7 +49,8 @@ _MATCH_THRESHOLD = 2
 class ApiRegistry:
     """接口路径注册表（JSON 持久化 + 特征匹配）。"""
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, memory=False):
+        self.memory = memory  # True：只存内存，不落盘（后台预读等辅助场景，避免污染共享注册表）
         self.file = path or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "..", "config", "api_registry.json")
@@ -79,6 +80,8 @@ class ApiRegistry:
 
     def save(self):
         self.data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        if self.memory:
+            return True  # 内存模式不落盘
         try:
             os.makedirs(os.path.dirname(self.file), exist_ok=True)
             with open(self.file, "w", encoding="utf-8") as f:

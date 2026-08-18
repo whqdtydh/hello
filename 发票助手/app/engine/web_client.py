@@ -10,7 +10,7 @@ import re
 import time
 
 import requests
-from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
+from PySide6.QtCore import QEventLoop, QObject, QThread, QTimer, Signal
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
@@ -23,6 +23,8 @@ class WebClient(QObject):
     """封装 QWebEngineView，提供邮箱自动化所需的原子操作 + 会话管理。"""
 
     log_signal = Signal(str)
+    _js_req = Signal(str, int)     # (script, timeout)：后台线程 → GUI 线程
+    _js_done = Signal(object)      # 结果回传
 
     def __init__(self, view: QWebEngineView, parent=None):
         super().__init__(parent)
@@ -38,6 +40,9 @@ class WebClient(QObject):
 
         # cookie 收集器（请求时供 requests 复用会话）
         self.cookies = CookieStore(self.profile, config.COOKIE_FILE)
+
+        # JS 跨线程调度（QtWebEngine 只能在 GUI 线程执行 JS）
+        self._js_req.connect(self._js_exec)
 
     # ---------- JS 执行 ----------
     def run_js(self, script, timeout=20000):
@@ -73,6 +78,47 @@ class WebClient(QObject):
     def run_js_obj(self, script, timeout=20000):
         """执行 JS，自动把 JSON 字符串解析为 Python 对象。"""
         value = self.run_js(script, timeout=timeout)
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
+
+    # ---------- 线程安全 JS 执行 ----------
+    def run_js_threadsafe(self, script, timeout=20000):
+        """任意线程安全执行 JS：非 GUI 线程调用时经信号槽转发到 GUI 线程执行。
+
+        QtWebEngine 的 runJavaScript 只能在 GUI 线程调用，后台线程直接调用
+        会触发断言崩溃（0x80000003）。本方法自动处理线程切换。
+        """
+        if QThread.currentThread() is self.thread():
+            return self.run_js(script, timeout=timeout)
+        from PySide6.QtCore import QEventLoop
+        holder = {}
+
+        def _on_done(v):
+            holder["value"] = v
+            holder["loop"].quit()
+
+        loop = QEventLoop()
+        holder["loop"] = loop
+        self._js_done.connect(_on_done)
+        self._js_req.emit(script, timeout)
+        loop.exec()
+        self._js_done.disconnect(_on_done)
+        return holder.get("value")
+
+    def _js_exec(self, script, timeout):
+        """槽：在 GUI 线程执行 JS（run_js_threadsafe 的回调侧）。"""
+        try:
+            v = self.run_js(script, timeout=timeout)
+            self._js_done.emit(v)
+        except Exception as e:
+            self._js_done.emit("__JS_ERR__:" + str(e))
+
+    def run_js_obj_threadsafe(self, script, timeout=20000):
+        value = self.run_js_threadsafe(script, timeout=timeout)
         if isinstance(value, str):
             try:
                 return json.loads(value)
@@ -366,7 +412,8 @@ class WebClient(QObject):
 
     def _set_api_observing(self, on):
         try:
-            self.run_js(
+            # 可能在后台线程调用（接口学习流程），必须走线程安全通道
+            self.run_js_threadsafe(
                 f"(function(){{"
                 f"window.__invoiceApiObserving={'true' if on else 'false'};"
                 f"if({'true' if on else 'false'}){{try{{localStorage.removeItem('invoice_api_obs');}}catch(e){{}}}}"
@@ -375,14 +422,16 @@ class WebClient(QObject):
         except Exception:
             pass
 
+    def get_observed_requests_script(self):
+        """读取观察请求的 JS 脚本（可在线程安全通道执行）。"""
+        return ("(function(){"
+                "try{return localStorage.getItem('invoice_api_obs')||'[]';}"
+                "catch(e){return '[]';}})()")
+
     def get_observed_requests(self):
         """读取观察到的请求列表：[{u: url, m: method, t: timestamp}]。"""
         try:
-            val = self.run_js_obj(
-                "(function(){"
-                "try{return localStorage.getItem('invoice_api_obs')||'[]';}"
-                "catch(e){return '[]';}})()",
-                timeout=5000)
+            val = self.run_js_obj(self.get_observed_requests_script(), timeout=5000)
         except Exception:
             return []
         if not isinstance(val, str):

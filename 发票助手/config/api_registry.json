@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-19 02:36:51",
+  "endpoints": {
+    "maillist": {
+      "path": "/list/maillist",
+      "method": "GET",
+      "path_kw": [
+        "list",
+        "maillist"
+      ],
+      "params": [
+        "dirid",
+        "page_now",
+        "page_size"
+      ],
+      "status": "ok"
+    },
+    "readmail": {
+      "path": "/read/readmail",
+      "method": "POST",
+      "path_kw": [
+        "read",
+        "readmail"
+      ],
+      "params": [
+        "mailid"
+      ],
+      "status": "ok"
+    },
+    "fapiao": {
+      "path": "/fapiao/download",
+      "method": "GET",
+      "path_kw": [
+        "fapiao",
+        "download"
+      ],
+      "params": [
+        "fapiao_list"
+      ],
+      "status": "ok"
+    }
+  }
+}

@@ -9,12 +9,16 @@ POST 到本服务，写入 SQLite。主程序下载前用 mailid 查询回填真
   GET  /get      ?mailid=xxx    → {"ok": true, "data": {...}} 或 {"ok": false}
   GET  /all      → 全部记录
   GET  /health   → {"ok": true}
+  POST /check    {"mailid": str}          → 登记「待预读」邮件（边勾边读）
+  GET  /pending                          → 待预读 mailid 列表
+  POST /done     {"mailid": str}          → 预读完成，移出队列
 """
 
 import json
 import os
 import sqlite3
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HOST = "127.0.0.1"
@@ -39,6 +43,12 @@ def init_db():
             "  subject TEXT DEFAULT '',"
             "  time TEXT DEFAULT '',"
             "  created_at DATETIME DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS preload_pending ("
+            "  mailid TEXT PRIMARY KEY,"
+            "  ts INTEGER DEFAULT 0"
             ")"
         )
         conn.commit()
@@ -93,6 +103,45 @@ def all_records():
         conn.close()
 
 
+# ---------- 预读队列（边勾边读） ----------
+
+def enqueue_preload(mailid):
+    """登记待预读邮件（勾选时由网页 JS 上报）。"""
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO preload_pending (mailid, ts) VALUES (?,?)",
+            (mailid, int(time.time())),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def pending_preload():
+    conn = _connect()
+    try:
+        cur = conn.execute("SELECT mailid FROM preload_pending ORDER BY ts ASC")
+        return [r[0] for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def done_preload(mailid):
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM preload_pending WHERE mailid=?", (mailid,))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -121,6 +170,24 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send(400, {"ok": False, "error": "bad json"})
             return
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+        # 预读登记（边勾边读）：仅需 mailid
+        if path == "/check":
+            mid = str(data.get("mailid", "")).strip()
+            if not mid:
+                self._send(400, {"ok": False, "error": "mailid required"})
+                return
+            ok = enqueue_preload(mid)
+            self._send(200, {"ok": ok, "mailid": mid})
+            return
+        # 预读完成通知
+        if path == "/done":
+            mid = str(data.get("mailid", "")).strip()
+            ok = done_preload(mid) if mid else False
+            self._send(200, {"ok": ok, "mailid": mid})
+            return
+        # 默认：Message-ID 登记
         mailid = str(data.get("mailid", "")).strip()
         message_id = str(data.get("message_id", "")).strip()
         if not mailid or not message_id:
@@ -146,6 +213,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(404, {"ok": False, "error": "not found"})
         elif u.path == "/all":
             self._send(200, {"ok": True, "data": all_records()})
+        elif u.path == "/pending":
+            self._send(200, {"ok": True, "data": pending_preload()})
         else:
             self._send(404, {"ok": False, "error": "unknown"})
         self._save = None

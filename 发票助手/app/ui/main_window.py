@@ -240,6 +240,10 @@ class MainWindow(QWidget):
         self._was_maximized = False
         self._setup_shortcuts()
         self._build_ui(profile)
+        # 边勾边读：后台预读器（勾选时立即拉详情，下载时零等待）
+        from app.engine.preloader import Preloader
+        self.preloader = Preloader(self.web)
+        self.preloader.start()
         self.log_signal.connect(self._log)
         self.progress_signal.connect(self._progress_slot)
         self.done_signal.connect(self._done_slot)
@@ -829,7 +833,9 @@ class MainWindow(QWidget):
 
     def _run_api_download(self, dest, mails, sid):
         try:
-            ctrl = ApiDownloadController(self.web, dest, on_log=self.log_signal.emit, on_progress=self.progress_signal.emit)
+            ctrl = ApiDownloadController(self.web, dest, on_log=self.log_signal.emit,
+                                         on_progress=self.progress_signal.emit,
+                                         preloader=self.preloader)
             self.api_ctrl = ctrl
             files = ctrl.run(mails, sid=sid)
             self.done_signal.emit(files)

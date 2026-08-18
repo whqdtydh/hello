@@ -15,6 +15,7 @@ from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from app import config
+from app.engine import msgid_service
 from app.engine.cookie_store import CookieStore
 
 
@@ -247,6 +248,12 @@ class WebClient(QObject):
                      time:timeOf(item),fulltext:(item.innerText||'').slice(0,400),
                      ts:Date.now()};
         saveAll(all);
+        // 勾选时上报本机服务 → 后台预读详情（边勾边读，下载时零等待）
+        try{
+          fetch('http://127.0.0.1:__PRELOAD_PORT__/check',
+                {method:'POST', headers:{'Content-Type':'application/json'},
+                 body: JSON.stringify({mailid: mailid})});
+        }catch(e){}
         // 勾选时立即尝试提取 Message-ID（异步）
         try{
           var _dm='';
@@ -287,7 +294,10 @@ class WebClient(QObject):
         script.setName('invoice_tracker')
         script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
         script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setSourceCode(self.TRACKER_SCRIPT)
+        # 端口运行时替换（避免硬编码漂移）
+        src = self.TRACKER_SCRIPT.replace(
+            "__PRELOAD_PORT__", str(msgid_service.PORT))
+        script.setSourceCode(src)
         self.profile.scripts().insert(script)
 
     # ---------- 接口观察（失效自动学习） ----------

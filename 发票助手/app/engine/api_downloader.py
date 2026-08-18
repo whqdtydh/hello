@@ -466,12 +466,13 @@ class ApiDownloadController:
       更新注册表后，用新接口路径继续下载。
     """
 
-    def __init__(self, client: WebClient, save_dir, on_log=None, on_progress=None):
+    def __init__(self, client: WebClient, save_dir, on_log=None, on_progress=None, preloader=None):
         self.client = client
         self.save_dir = save_dir
         self.on_log = on_log or (lambda m, g="": None)
         self.on_progress = on_progress or (lambda p, t, d: None)
         self.registry = ApiRegistry()
+        self._preloader = preloader  # 边勾边读缓存（可选）
 
         self.downloaded_files = []
         self.downloaded_pdf_count = 0
@@ -686,8 +687,14 @@ class ApiDownloadController:
         date_str = ""
         self.log(f"[详情] {subject[:50]}…")
         try:
-            # 1) 先拉详情（readmail func=1 拿正文 + 附件信息）
-            item = self._api.fetch_readmail(mailid, func=1)
+            # 1) 先拉详情（readmail func=1 拿正文 + 附件信息）；边勾边读命中时直接用
+            item = None
+            if self._preloader is not None:
+                item = self._preloader.get_detail(mailid)
+                if item:
+                    self.log("  详情来自预读缓存（边勾边读）")
+            if item is None:
+                item = self._api.fetch_readmail(mailid, func=1)
             if not item:
                 self.log("  详情获取失败")
                 self._cur_group = ""
@@ -789,6 +796,11 @@ class ApiDownloadController:
     def _get_attach_urls(self, mailid):
         """从 maillist 缓存获取邮件的附件下载 URL 列表。
         边拉边处理：缓存未命中时等待拉取线程（最多 15 秒），超时后逐页单查。"""
+        # 边勾边读：预读器已预拉 maillist 全量，直接命中
+        if self._preloader is not None:
+            urls = self._preloader.get_attach_urls(mailid)
+            if urls is not None:
+                return urls
         it = self._cache_get(mailid)
         if it:
             return [a.get("download_url", "") for a in it.get("normal_attach", []) or [] if a.get("download_url")]

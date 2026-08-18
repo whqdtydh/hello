@@ -70,8 +70,14 @@ class TestKindFromPdf:
         assert mail_parse.kind_from_pdf(t) == "酒店发票"
 
     def test_taxi(self):
-        t = "滴滴出行 电子发票 运输服务*客运服务费 行程单"
+        # 打车发票票面含「客运服务费」项目名称（真实发票不含"行程单"字样）
+        t = "滴滴出行 电子发票 运输服务*客运服务费"
         assert mail_parse.kind_from_pdf(t) == "打车发票"
+
+    def test_taxi_itinerary(self):
+        # 行程单票面含「行程单/行程时间」字样，命名应归为行程单而非打车发票
+        t = "高德地图—打车——行程单 行程时间 2026-07-28 曹操出行 62.95元"
+        assert mail_parse.kind_from_pdf(t) == "电子行程单"
 
     def test_unknown_keep_original(self):
         # 识别不到返回空串，调用方保持原分类

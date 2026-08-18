@@ -433,6 +433,8 @@ class MainWindow(QWidget):
         self.view.setAttribute(Qt.WA_TranslucentBackground, True)
         self.view.page().setBackgroundColor(QColor(255, 255, 255))
         self.view.setStyleSheet("background: white; border: none;")
+        # 渲染进程崩溃监控：记录崩溃原因与退出码，便于诊断闪退
+        self.view.page().renderProcessTerminated.connect(self._on_render_crashed)
         wc_lay.addWidget(self.view, 1)
         self.web = WebClient(self.view)
         self.web.log_signal.connect(self._log)
@@ -473,6 +475,26 @@ class MainWindow(QWidget):
             self.showNormal()
             if self._normal_geometry is not None:
                 self.setGeometry(self._normal_geometry)
+
+    def _on_render_crashed(self, status):
+        """渲染进程崩溃回调：记录崩溃状态，便于诊断闪退。"""
+        try:
+            from PySide6.QtWebEngineCore import QWebEnginePage
+            names = {QWebEnginePage.RenderProcessCrashStatus.Crashed: "进程崩溃",
+                     QWebEnginePage.RenderProcessCrashStatus.Terminated: "被终止",
+                     QWebEnginePage.RenderProcessCrashStatus.Killed: "被杀死",
+                     QWebEnginePage.RenderProcessCrashStatus.NormalTermination: "正常退出"}
+            why = names.get(status, f"未知({status})")
+            self._log(f"💥 WebView 渲染进程异常: {why}")
+            # 同时写入独立诊断文件，防止窗口无响应时丢失
+            try:
+                import time
+                with open(r"D:\AI\git\发票助手\crash_diag.log", "a", encoding="utf-8") as f:
+                    f.write(f"[{time.strftime('%H:%M:%S')}] RENDER CRASH: {why}\n")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _close_app(self):
         """关闭按钮：正常关闭窗口并退出应用。"""

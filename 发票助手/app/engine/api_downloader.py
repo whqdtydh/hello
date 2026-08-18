@@ -542,7 +542,7 @@ class ApiDownloadController:
             return []
         # 接口失效学习：运行前检查 failed 接口，尝试从网页观察记录更新路径
         self._maybe_learn_api()
-        self.log(f"应下载 {len(selected_mails)} 封邮件", "__summary__")
+        self.log(f"应下载 {len(selected_mails)} 封邮件", "__summary_1")
         self.prepare(selected_mails, sid=sid)
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mail") as pool:
             futures = [pool.submit(self._safe_process_one, m, i)
@@ -550,20 +550,25 @@ class ApiDownloadController:
             for f in futures:
                 f.result()
         self.log(f"全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
-        # 顶部总结：应下载邮件数 / 下载 PDF 数 / 总金额 / 行程单 / 失败 / 类型分布 / 待确认
+        # 顶部总结（拆两行避免超长截断）：
+        # 行1：应下载邮件数 / 下载 PDF 数 / 总金额 / 行程单 / 失败
+        # 行2：类型分布 / 待确认日期
         summary = (f"应下载 {len(selected_mails)} 封邮件，下载 {len(self.downloaded_files)} 个 PDF，"
                    f"总金额 {self._total_amount:.2f} 元")
         if self._itinerary_mails:
             summary += f"，含行程单 {self._itinerary_mails} 封"
         if self._failed_mails:
             summary += f"，失败 {self._failed_mails} 封"
+        self.log(summary, "__summary_1")
+        sub = []
         if self._kind_counts:
-            summary += "；" + " / ".join(
+            sub.append(" / ".join(
                 f"{k} {v} 张" for k, v in
-                sorted(self._kind_counts.items(), key=lambda x: -x[1]))
+                sorted(self._kind_counts.items(), key=lambda x: -x[1])))
         if self._pending_count:
-            summary += f"，待确认日期 {self._pending_count} 个"
-        self.log(summary, "__summary__")
+            sub.append(f"待确认日期 {self._pending_count} 个")
+        if sub:
+            self.log(" · ".join(sub), "__summary_2")
         self._archive_by_amount()
         return self.downloaded_files
 

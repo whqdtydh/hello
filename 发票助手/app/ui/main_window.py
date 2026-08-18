@@ -663,16 +663,24 @@ class MainWindow(QWidget):
         if top is None:
             top = QTreeWidgetItem([msg])
             self._tree_map[group] = top
-            self.result_tree.addTopLevelItem(top)
             f = top.font(0)
             f.setBold(True)
             top.setFont(0, f)
             top.setForeground(0, QBrush(QColor("#111827")))
-            if group == "__summary__":
-                self.result_tree.insertTopLevelItem(0, top)  # 总结固定置顶
+            if group.startswith("__summary"):
+                # 总结行：依次排在所有邮件分组之前（保持先后顺序）
+                idx = 0
+                while idx < self.result_tree.topLevelItemCount():
+                    if self.result_tree.topLevelItem(idx).data(0, Qt.UserRole) != "summary":
+                        break
+                    idx += 1
+                self.result_tree.insertTopLevelItem(idx, top)
+                top.setData(0, Qt.UserRole, "summary")
+            else:
+                self.result_tree.addTopLevelItem(top)
             return
-        if group == "__summary__":
-            # 顶部总结：随下载进度更新（检测邮件数 → 加 PDF 数 → 加总金额）
+        if group.startswith("__summary"):
+            # 顶部总结行：随下载进度更新（占位 → 完整内容）
             top.setText(0, msg)
             return
         if msg.startswith("[处理]"):

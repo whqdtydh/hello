@@ -670,7 +670,6 @@ class MainWindow(QWidget):
             top.setForeground(0, QBrush(QColor("#111827")))
             if group == "__summary__":
                 self.result_tree.insertTopLevelItem(0, top)  # 总结固定置顶
-            top.setExpanded(True)
             return
         if group == "__summary__":
             # 顶部总结：随下载进度更新（检测邮件数 → 加 PDF 数 → 加总金额）
@@ -679,7 +678,6 @@ class MainWindow(QWidget):
         if msg.startswith("[处理]"):
             top.setText(0, msg[len("[处理]"):].strip())
             top.setForeground(0, QBrush(QColor("#1E3A5F")))
-            top.setExpanded(True)
         elif msg.startswith("[成功]"):
             child = QTreeWidgetItem([msg[len("[成功]"):].strip()])
             child.setForeground(0, QBrush(QColor("#059669")))
@@ -832,14 +830,26 @@ class MainWindow(QWidget):
 
 
 class _CopyableTree(QTreeWidget):
-    """支持 Ctrl+C 复制选中条目文本的结果树。"""
+    """支持 Ctrl+C 复制选中条目文本的结果树。
+
+    折叠状态下复制顶级项时，会递归收集其下所有子日志（带缩进层级），
+    配合 Ctrl+A 全选即可一次复制整棵树的全部内容。
+    """
+
+    def _collect_text(self, item, depth=0):
+        lines = [("  " * depth) + item.text(0)]
+        for i in range(item.childCount()):
+            lines.extend(self._collect_text(item.child(i), depth + 1))
+        return lines
 
     def keyPressEvent(self, e):
         if e.matches(QKeySequence.Copy):
             items = self.selectedItems()
             if items:
-                QApplication.clipboard().setText(
-                    "\n".join(it.text(0) for it in reversed(items)))
+                lines = []
+                for it in reversed(items):
+                    lines.extend(self._collect_text(it))
+                QApplication.clipboard().setText("\n".join(lines))
                 e.accept()
                 return
         super().keyPressEvent(e)

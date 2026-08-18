@@ -227,6 +227,8 @@ class MainWindow(QWidget):
         super().__init__()
         self.engine = None
         self._running = False
+        self._checkboxes = {}   # mailid → QCheckBox（邮件列表勾选状态）
+        self._mail_rows = {}    # mailid → (subject, sender)（表格数据副本）
         self.setObjectName("Root")
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -741,9 +743,12 @@ class MainWindow(QWidget):
     def _collect_selected_mails(self):
         """从表格勾选状态收集邮件（Python 内存管理，100% 精确）。"""
         mails = []
+        if not self._checkboxes or self._mail_table.rowCount() == 0:
+            self._log("⚠ 邮件列表尚未加载，请先点「⟳ 刷新列表」加载邮件后再勾选。")
+            return mails
         for mailid, cb in self._checkboxes.items():
             if cb.isChecked():
-                # 从表格行取 subject / sender
+                # 优先从表格行取 subject / sender
                 subject = ""
                 sender = ""
                 for r in range(self._mail_table.rowCount()):

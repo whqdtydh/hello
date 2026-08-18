@@ -273,6 +273,18 @@ class WebClient(QObject):
       }
     }
   }
+  // ===== click 延迟校验：点击后 100ms 检查勾选状态是否真的变化 =====
+  //  - 点 checkbox 勾选 → 状态变化 → syncItem 记录（不漏识别）
+  //  - 点 checkbox 取消 → 状态变化 → syncItem 删除（不残留）
+  //  - 点邮件行打开查看 → 勾选状态不变 → 不记录（不多识别）
+  document.addEventListener('click', function(e){
+    var t=e.target;
+    var item=t.closest?t.closest('div[class*=list-item]'):null;
+    if(!item)return;
+    var mailid=item.getAttribute('data-mailid')||'';
+    if(!mailid)return;
+    setTimeout(function(){ syncItem(item); }, 100);
+  }, true);
   var _obs=new MutationObserver(function(muts){
     for(var i=0;i<muts.length;i++){
       var m=muts[i];

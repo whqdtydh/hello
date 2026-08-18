@@ -135,3 +135,19 @@ class CookieStore(QObject):
                 secure = bool(c.isSecure())
                 jar.set(name, value, domain=d, path=path, secure=secure)
         return jar
+
+    # ---------- 清理（更换账号） ----------
+    def clear_all(self):
+        """清空内存、持久化文件与 QtWebEngine cookie store。"""
+        with self._lock:
+            self._cookies = {}
+        try:
+            self._store.deleteAllCookies()
+        except Exception:
+            pass
+        try:
+            os.makedirs(os.path.dirname(self._file), exist_ok=True)
+            with open(self._file, "w", encoding="utf-8") as f:
+                json.dump([], f)
+        except Exception:
+            pass

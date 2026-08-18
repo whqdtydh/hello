@@ -227,8 +227,6 @@ class MainWindow(QWidget):
         super().__init__()
         self.engine = None
         self._running = False
-        self._checkboxes = {}   # mailid → QCheckBox（邮件列表勾选状态）
-        self._mail_rows = {}    # mailid → (subject, sender)（表格数据副本）
         self.setObjectName("Root")
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -432,54 +430,17 @@ class MainWindow(QWidget):
         wc_lay = QVBoxLayout(self._web_card)
         wc_lay.setContentsMargins(0, 0, 0, 0)
         wc_lay.setSpacing(0)
-        # 左侧双页签：邮件列表（API，程序内勾选） + 邮箱网页（登录用）
-        self._left_tabs = QTabWidget()
-        self._left_tabs.setDocumentMode(True)
-        self._left_tabs.setStyleSheet(
-            "QTabWidget::pane { border: none; background: transparent; }"
-            "QTabBar::tab { background: rgba(255,255,255,0.45); color: #374151; "
-            "border: none; border-radius: 6px; padding: 5px 14px; margin: 2px; font-size: 12px; }"
-            "QTabBar::tab:selected { background: rgba(30,58,95,0.85); color: #ffffff; }"
-            "QTabBar::tab:hover:!selected { background: rgba(255,255,255,0.70); }")
-        # Tab1：邮件列表（API）
-        self._mail_tab = QWidget()
-        self._mail_tab.setStyleSheet("background: transparent;")
-        mt = QVBoxLayout(self._mail_tab)
-        mt.setContentsMargins(4, 4, 4, 4)
-        mt.setSpacing(6)
-        mt.addWidget(self._build_mail_list_bar(), 0)
-        self._mail_table = QTableWidget(0, 3)
-        self._mail_table.setHorizontalHeaderLabels(["勾选", "发件人", "主题"])
-        self._mail_table.verticalHeader().setVisible(False)
-        self._mail_table.setShowGrid(False)
-        self._mail_table.setAlternatingRowColors(True)
-        self._mail_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._mail_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._mail_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self._mail_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self._mail_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self._mail_table.setStyleSheet(
-            "QTableWidget { background: rgba(255,255,255,0.55); border: 1px solid rgba(200,210,220,0.35); "
-            "border-radius: 8px; color: #111827; font-size: 12px; gridline-color: transparent; }"
-            "QTableWidget::item { padding: 4px 6px; border-bottom: 1px solid rgba(0,0,0,0.04); }"
-            "QTableWidget::item:selected { background: rgba(30,58,95,0.12); color: #111827; }"
-            "QHeaderView::section { background: rgba(255,255,255,0.60); color: #1E3A5F; "
-            "border: none; padding: 5px; font-weight: 700; }")
-        self._mail_table.cellClicked.connect(self._on_mail_row_click)
-        mt.addWidget(self._mail_table, 1)
-        # Tab2：邮箱网页（登录 / 会话）— 默认显示，保持原来的网页勾选流程
+        # 左侧 = 内嵌 QQ 邮箱网页（登录 / 勾选邮件）
         self.view = QWebEngineView(profile) if profile else QWebEngineView()
         self.view.setAttribute(Qt.WA_TranslucentBackground, True)
         self.view.page().setBackgroundColor(QColor(255, 255, 255))
         self.view.setStyleSheet("background: white; border: none;")
         # 渲染进程崩溃监控：记录崩溃原因与退出码，便于诊断闪退
         self.view.page().renderProcessTerminated.connect(self._on_render_crashed)
-        self._left_tabs.addTab(self.view, "邮箱网页")
-        self._left_tabs.addTab(self._mail_tab, "邮件列表")
-        self._left_tabs.setCurrentIndex(0)  # 默认显示网页（原流程）
         self.web = WebClient(self.view)
         self.web.log_signal.connect(self._log)
-        wc_lay.addWidget(self._left_tabs, 1)
+        self.web._install_tracker()
+        wc_lay.addWidget(self.view, 1)
         cl.addWidget(self._web_card, 7)
 
         right_panel = QWidget()
@@ -598,169 +559,7 @@ class MainWindow(QWidget):
         v.addWidget(t)
         return card, v
 
-    # ---------- API 邮件列表（全 API 模式，程序内勾选） ----------
-
-    def _build_mail_list_bar(self):
-        """邮件列表顶部工具行：刷新 / 全选 / 清空 / 搜索。"""
-        bar = QWidget()
-        bar.setStyleSheet("background: transparent;")
-        row = QHBoxLayout(bar)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-        self._btn_style = (
-            "QPushButton { border: 1px solid rgba(200,210,220,0.50); border-radius: 7px; "
-            "background: rgba(255,255,255,0.55); font-size: 12px; font-weight: 600; color: #374151; padding: 4px 10px; }"
-            "QPushButton:hover { background: rgba(255,255,255,0.80); border-color: #6B7280; }")
-        self.refresh_btn = QPushButton("⟳ 刷新列表")
-        self.refresh_btn.setStyleSheet(self._btn_style)
-        self.refresh_btn.clicked.connect(self.on_refresh_list)
-        row.addWidget(self.refresh_btn)
-        self.select_all_btn = QPushButton("全选")
-        self.select_all_btn.setStyleSheet(self._btn_style)
-        self.select_all_btn.clicked.connect(self.on_select_all)
-        row.addWidget(self.select_all_btn)
-        self.clear_btn = QPushButton("清空")
-        self.clear_btn.setStyleSheet(self._btn_style)
-        self.clear_btn.clicked.connect(self.on_clear_selection)
-        row.addWidget(self.clear_btn)
-        self._search_edit = QLineEdit()
-        self._search_edit.setPlaceholderText("搜索主题/发件人…")
-        self._search_edit.setStyleSheet(
-            "QLineEdit { background: rgba(255,255,255,0.55); border: 1px solid rgba(200,210,220,0.40); "
-            "border-radius: 7px; padding: 4px 8px; font-size: 12px; color: #111827; }")
-        self._search_edit.textChanged.connect(self._apply_search_filter)
-        row.addWidget(self._search_edit, 1)
-        self._list_label = QLabel("未加载")
-        self._list_label.setStyleSheet("font-size: 11px; color: #6B7280; background: transparent;")
-        row.addWidget(self._list_label)
-        return bar
-
-    def _mail_items_for_display(self):
-        """返回当前表格中按搜索过滤后的行索引列表。"""
-        rows = []
-        for r in range(self._mail_table.rowCount()):
-            item = self._mail_table.item(r, 2)
-            if item is None:
-                continue
-            if not self._search_text():
-                rows.append(r)
-                continue
-            hay = (self._mail_table.item(r, 1).text() if self._mail_table.item(r, 1) else "") + " " + item.text()
-            if self._search_text().lower() in hay.lower():
-                rows.append(r)
-        return rows
-
-    def _search_text(self):
-        try:
-            return self._search_edit.text().strip()
-        except Exception:
-            return ""
-
-    def _apply_search_filter(self):
-        """搜索时隐藏不匹配的行（勾选状态保留在数据层）。"""
-        q = self._search_text()
-        for r in range(self._mail_table.rowCount()):
-            item = self._mail_table.item(r, 2)
-            if item is None:
-                continue
-            hay = (self._mail_table.item(r, 1).text() if self._mail_table.item(r, 1) else "") + " " + item.text()
-            self._mail_table.setRowHidden(r, q and q.lower() not in hay.lower())
-
-    def on_refresh_list(self):
-        """通过 API 拉取邮件列表并填充表格（不依赖网页 DOM）。"""
-        self._log("正在通过 API 拉取邮件列表…")
-        self._set_status("拉取邮件列表…", "busy")
-        try:
-            sid = self.web.get_sid()
-            if not sid:
-                self._set_status("未登录", "error")
-                self._log("未检测到登录状态，请先切到「邮箱网页」页签登录 QQ 邮箱，再刷新列表。")
-                self._left_tabs.setCurrentIndex(0)
-                return
-            jar = self.web.cookies.get_cookie_jar("https://wx.mail.qq.com/")
-            from app.engine.api_downloader import QQMailApi
-            api = QQMailApi(jar, sid, on_log=self.log_signal.emit)
-            mapping = api.fetch_maillist_all(max_pages=40)
-            self._fill_mail_table(mapping)
-            self._log(f"✅ 邮件列表加载完成：共 {len(mapping)} 封")
-            self._set_status(f"列表 {len(mapping)} 封", "ready")
-            self._left_tabs.setCurrentIndex(1)  # 刷新成功自动切到「邮件列表」页签，直接勾选
-            self._log("请在「邮件列表」中勾选需要下载的邮件，再点「开始下载」。")
-        except Exception as e:
-            self._log(f"❌ 拉取邮件列表失败: {str(e)[:100]}")
-            self._set_status("拉取失败", "error")
-
-    def _fill_mail_table(self, mapping):
-        """把 {mailid: item} 填充到表格；每行 Data role 存 mailid。"""
-        self._mail_table.setRowCount(0)
-        self._mail_table.setRowCount(len(mapping))
-        self._checkboxes = {}
-        r = 0
-        for mailid, it in mapping.items():
-            subject = it.get("subject") or it.get("title") or ""
-            sender = it.get("from", {}) or {}
-            if isinstance(sender, dict):
-                sender_name = sender.get("name") or sender.get("addr") or ""
-            else:
-                sender_name = str(sender)
-            date_str = ""
-            try:
-                import datetime
-                ts = it.get("dateline") or it.get("time") or it.get("timestamp") or 0
-                if ts:
-                    date_str = datetime.datetime.fromtimestamp(int(ts)).strftime("%m-%d %H:%M")
-            except Exception:
-                pass
-            cb = QCheckBox()
-            cb.setStyleSheet("margin-left: 6px;")
-            self._mail_table.setCellWidget(r, 0, cb)
-            self._mail_table.setItem(r, 1, QTableWidgetItem(sender_name))
-            self._mail_table.setItem(r, 2, QTableWidgetItem(subject))
-            self._mail_table.item(r, 1).setData(Qt.UserRole, mailid)
-            self._mail_table.item(r, 1).setToolTip(sender_name)
-            self._mail_table.item(r, 2).setToolTip(subject)
-            self._checkboxes[mailid] = cb
-            r += 1
-        self._list_label.setText(f"共 {len(mapping)} 封")
-
-    def _on_mail_row_click(self, row, col):
-        """点击行：切换该行勾选状态。"""
-        item = self._mail_table.item(row, 1)
-        if item is None:
-            return
-        mailid = item.data(Qt.UserRole)
-        cb = self._checkboxes.get(mailid)
-        if cb:
-            cb.setChecked(not cb.isChecked())
-
-    def on_select_all(self):
-        for cb in self._checkboxes.values():
-            cb.setChecked(True)
-
-    def on_clear_selection(self):
-        for cb in self._checkboxes.values():
-            cb.setChecked(False)
-
-    def _collect_selected_mails(self):
-        """从表格勾选状态收集邮件（Python 内存管理，100% 精确）。"""
-        mails = []
-        if not self._checkboxes or self._mail_table.rowCount() == 0:
-            self._log("⚠ 邮件列表尚未加载，请先点「⟳ 刷新列表」加载邮件后再勾选。")
-            return mails
-        for mailid, cb in self._checkboxes.items():
-            if cb.isChecked():
-                # 优先从表格行取 subject / sender
-                subject = ""
-                sender = ""
-                for r in range(self._mail_table.rowCount()):
-                    item = self._mail_table.item(r, 1)
-                    if item and item.data(Qt.UserRole) == mailid:
-                        sender = self._mail_table.item(r, 1).text()
-                        subject = self._mail_table.item(r, 2).text() if self._mail_table.item(r, 2) else ""
-                        break
-                mails.append({"mailid": mailid, "sender": sender,
-                              "subject": subject, "text": subject + " " + sender})
-        return mails
+    # ---------- 右侧控制 ----------
 
     def _build_dir_card(self):
         card, v = self._card("保存目录")
@@ -778,14 +577,26 @@ class MainWindow(QWidget):
         browse_btn.clicked.connect(self.on_browse)
         row.addWidget(browse_btn)
         v.addLayout(row)
-        open_mail_btn = QPushButton("打开邮箱网页版")
+        # 邮箱操作：打开邮箱网页 / 更换 QQ 邮箱
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        open_mail_btn = QPushButton("打开邮箱网页")
         open_mail_btn.setMinimumHeight(32)
         open_mail_btn.setStyleSheet(
             "QPushButton { border: 1px solid rgba(200,210,220,0.50); border-radius: 8px; "
             "background: rgba(255,255,255,0.50); font-size: 12px; font-weight: 600; color: #374151; }"
             "QPushButton:hover { background: rgba(255,255,255,0.70); border-color: #6B7280; }")
         open_mail_btn.clicked.connect(self.on_load_mail)
-        v.addWidget(open_mail_btn)
+        btn_row.addWidget(open_mail_btn, 1)
+        switch_mail_btn = QPushButton("更换 QQ 邮箱")
+        switch_mail_btn.setMinimumHeight(32)
+        switch_mail_btn.setStyleSheet(
+            "QPushButton { border: 1px solid rgba(200,210,220,0.50); border-radius: 8px; "
+            "background: rgba(255,255,255,0.50); font-size: 12px; font-weight: 600; color: #374151; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.70); border-color: #6B7280; }")
+        switch_mail_btn.clicked.connect(self.on_switch_account)
+        btn_row.addWidget(switch_mail_btn, 1)
+        v.addLayout(btn_row)
         return card
 
     def _build_action_card(self):
@@ -895,9 +706,19 @@ class MainWindow(QWidget):
         url = config.MAIL_HOME
         self._set_status("加载邮箱…", "busy")
         self.web.navigate(url)
-        self._left_tabs.setCurrentIndex(0)
         self._log(f"已打开：{url}")
-        self._log("请登录 QQ 邮箱；登录成功后切到「邮件列表」页签点「刷新列表」，在程序内勾选邮件。")
+        self._log("请在左侧勾选需要下载的邮件（可进入 报销 文件夹）。")
+
+    def on_switch_account(self):
+        """更换 QQ 邮箱：清除本地登录凭证并重新打开登录页。"""
+        self._log("正在清除登录凭证，准备更换 QQ 邮箱…")
+        try:
+            self.web.cookies.clear_all()
+            self._log("✅ 已清除登录凭证，正在打开登录页…")
+        except Exception as e:
+            self._log(f"⚠ 清除凭证失败: {str(e)[:60]}")
+        self.web.navigate(config.MAIL_HOME)
+        self._log(f"已打开：{config.MAIL_HOME}")
 
     def on_start(self):
         if self._running:
@@ -934,16 +755,12 @@ class MainWindow(QWidget):
             pass
         self._log("读取勾选的邮件…")
         self._start_busy("读取勾选的邮件…")
-        # 从底层解决：勾选状态完全由程序内列表（API 拉取 + Python 内存）管理，不依赖网页 DOM
-        mails = self._collect_selected_mails()
-        if not mails:
-            self._log("列表为空或未勾选，自动拉取最新邮件列表…")
-            self.on_refresh_list()
-            mails = self._collect_selected_mails()
+        # 读取网页中勾选的邮件（click 延迟校验 + DOM 扫描双保险）
+        mails = self.web.get_selected_mails()
         if not mails:
             self._stop_busy()
             self._set_status("无勾选邮件", "error")
-            QMessageBox.warning(self, "提示", "没有勾选邮件。请在「邮件列表」页签勾选要下载的邮件后重试。")
+            QMessageBox.warning(self, "提示", "没有检测到勾选的邮件。请在左侧 QQ 邮箱网页中勾选要下载的邮件。")
             self._running = False
             self.start_btn.setEnabled(True)
             return

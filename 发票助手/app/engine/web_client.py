@@ -226,16 +226,7 @@ class WebClient(QObject):
       return '';
     });
   }
-  // ===== MutationObserver：只有真实勾选状态变化才记录 =====
-  // 点击邮件行打开查看（无勾选状态变化）不会被误记录，彻底解决误下载问题
-  function itemOf(el){
-    var node=el;
-    while(node&&node!==document.body&&node.nodeType===1){
-      if(node.getAttribute&&node.getAttribute('data-mailid'))return node;
-      node=node.parentNode;
-    }
-    return null;
-  }
+  // ===== 勾选状态判定 =====
   function trulyChecked(el){
     if(el.querySelector('.ui-checkbox-icon-checked'))return true;
     if(el.querySelector('.checkbox-checked, .checkbox-selected, .checked-icon'))return true;
@@ -285,29 +276,6 @@ class WebClient(QObject):
     if(!mailid)return;
     setTimeout(function(){ syncItem(item); }, 100);
   }, true);
-  var _obs=new MutationObserver(function(muts){
-    for(var i=0;i<muts.length;i++){
-      var m=muts[i];
-      var t=m.target;
-      if(!t||t.nodeType!==1)continue;
-      if(m.type==='attributes'&&/class|checked|aria-checked|aria-selected/.test(m.attributeName||'')){
-        var it=itemOf(t);
-        if(it)syncItem(it);
-      }else if(m.type==='childList'){
-        for(var j=0;j<m.addedNodes.length;j++){
-          var n=m.addedNodes[j];
-          if(n.nodeType===1){var it2=itemOf(n);if(it2)syncItem(it2);}
-        }
-      }
-    }
-  });
-  function _startObserve(){
-    var root=document.querySelector('.mail_list')||document.querySelector('[class*=mail-list]')||document.body;
-    _obs.observe(root,{subtree:true,childList:true,attributes:true,
-                       attributeFilter:['class','checked','aria-checked','aria-selected']});
-  }
-  if(document.readyState==='complete')_startObserve();
-  else document.addEventListener('DOMContentLoaded',_startObserve);
 })();
 '''
 

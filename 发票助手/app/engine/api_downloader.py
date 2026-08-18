@@ -988,9 +988,10 @@ class ApiDownloadController:
                 amt = extract_amount_from_text(os.path.basename(dest))
             if amt > 0:
                 mail_amounts.add(amt)
-            # 类型分布统计（顶部总结用）
-            with self._lock:
-                self._kind_counts[kind] = self._kind_counts.get(kind, 0) + 1
+            # 类型分布统计（顶部总结用）；电子行程单不计入（由「含行程单 X 封」体现）
+            if "行程单" not in kind:
+                with self._lock:
+                    self._kind_counts[kind] = self._kind_counts.get(kind, 0) + 1
 
         # 清理临时目录
         try:

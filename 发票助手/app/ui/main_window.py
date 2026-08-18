@@ -577,9 +577,10 @@ class MainWindow(QWidget):
         browse_btn = QPushButton("浏览")
         browse_btn.setMinimumHeight(32)
         browse_btn.setStyleSheet(
-            "QPushButton { border: 1px solid rgba(200,210,220,0.50); border-radius: 8px; "
-            "background: rgba(255,255,255,0.50); font-size: 12px; font-weight: 600; color: #374151; }"
-            "QPushButton:hover { background: rgba(255,255,255,0.70); border-color: #6B7280; }")
+            "QPushButton { border: 2px solid #111827; border-radius: 8px; "
+            "background: rgba(255,255,255,0.50); font-size: 12px; font-weight: 700; color: #374151; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.80); }"
+            "QPushButton:pressed { background: rgba(30,58,95,0.15); }")
         browse_btn.clicked.connect(self.on_browse)
         row.addWidget(browse_btn)
         v.addLayout(row)

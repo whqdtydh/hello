@@ -1,5 +1,12 @@
 import sys, os, traceback, threading, time, faulthandler
 
+# ------------------- QtWebEngine 环境配置 -------------------
+# 禁用 GPU 加速以避免 Cache/显卡 权限导致的崩溃
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --disable-software-rasterizer --disable-features=VizDisplayCompositor"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ["QTWEBENGINE_DISABLE_GPU"] = "1"
+os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+
 os.chdir(r"D:\AI\git\发票助手")
 
 LOG = os.path.join(os.environ["TEMP"], "invoice_crash.log")
@@ -46,8 +53,8 @@ try:
     profile = QWebEngineProfile("invoice_profile", app)
     profile.setPersistentCookiesPolicy(
         QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-    profile.setCachePath(os.path.join(os.path.expanduser("~"), ".invoice_cache"))
-    profile.setPersistentStoragePath(os.path.join(os.path.expanduser("~"), ".invoice_data"))
+    profile.setCachePath(os.path.join(os.environ["TEMP"], ".invoice_cache"))
+    profile.setPersistentStoragePath(os.path.join(os.environ["TEMP"], ".invoice_data"))
 
     from app.engine import msgid_service
     msgid_service.start_server()

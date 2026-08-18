@@ -142,6 +142,12 @@ class WebClient(QObject):
   window.__invoiceTrackerInstalled=true;
   var KEY='invoice_selected';
   var MIDMAP='invoice_msgid_map';
+  var SESSION_KEY='invoice_session_start';
+  // ===== 会话隔离：页面加载即清空旧的选择记录，杜绝跨会话残留 =====
+  try{
+    localStorage.removeItem(KEY);
+    localStorage.setItem(SESSION_KEY, String(Date.now()));
+  }catch(e){}
   function senderOf(item){
     var s=item.querySelector('.mail-sender,.mail-name,[class*=sender]');
     return s?(s.innerText||'').trim().slice(0,80):'';
@@ -220,42 +226,76 @@ class WebClient(QObject):
       return '';
     });
   }
-  document.addEventListener('click', function(e){
-    var t=e.target;
-    // 扩大匹配范围：不仅匹配 checkbox 元素，还匹配点击发生在邮件项内且勾选状态变化的场景
-    var item=t.closest?t.closest('div[class*=list-item]'):null;
-    var cb=t.closest?t.closest('.mail-checkbox,.xmail-ui-checkbox,.checkbox,.check-box,.mail-check'):null;
-    if(!item) return;  // 不是邮件项内的点击，不处理
+  // ===== MutationObserver：只有真实勾选状态变化才记录 =====
+  // 点击邮件行打开查看（无勾选状态变化）不会被误记录，彻底解决误下载问题
+  function itemOf(el){
+    var node=el;
+    while(node&&node!==document.body&&node.nodeType===1){
+      if(node.getAttribute&&node.getAttribute('data-mailid'))return node;
+      node=node.parentNode;
+    }
+    return null;
+  }
+  function trulyChecked(el){
+    if(el.querySelector('.ui-checkbox-icon-checked'))return true;
+    if(el.querySelector('.checkbox-checked, .checkbox-selected, .checked-icon'))return true;
+    if(el.querySelector('[class*="checkbox"][class*="checked"], [class*="checkbox"][class*="selected"]'))return true;
+    if(el.querySelector('[aria-checked="true"], [aria-selected="true"]'))return true;
+    if(/mail-item-checked|item-checked|selected-item|checked-row/.test(el.className||''))return true;
+    var cb=el.querySelector('input[type="checkbox"]');
+    if(cb&&cb.checked)return true;
+    return false;
+  }
+  function syncItem(item){
     var mailid=item.getAttribute('data-mailid')||'';
-    if(!mailid) return;
-    // 勾选时立即尝试提取 Message-ID（异步）
-    if(!midMap()[mailid]){
-      // 优先从 DOM 属性直接抓（xmmx 开头），失败再走 readmail 接口
-      var _dm='';
-      try{
-        var _a=['data-messageid','data-mid','data-msgid','data-message-id'];
-        for(var _i=0;_i<_a.length;_i++){var _v=item.getAttribute(_a[_i]);if(_v&&/xmmx/.test(_v)){_dm=_v;break;}}
-        if(!_dm){var _s=item.querySelector('[data-messageid],[data-mid],[data-msgid],[data-message-id]'); if(_s){_dm=_s.getAttribute('data-messageid')||_s.getAttribute('data-mid')||'';}}
-      }catch(e){}
-      if(_dm){saveMid(mailid,_dm);}
-      else{grabMsgID(mailid);}
-    }
-    // 诊断：记录每次勾选操作到独立诊断 key，便于排查漏选问题
-    try{
-      var diag=JSON.parse(localStorage.getItem('invoice_diag')||'[]');
-      diag.push({mailid:mailid, ts:Date.now(), action:'click_on_item', has_cb:!!cb});
-      if(diag.length>50)diag=diag.slice(-50);
-      localStorage.setItem('invoice_diag',JSON.stringify(diag));
-    }catch(e){}
+    if(!mailid)return;
     var all=readAll();
-    if(all[mailid]){
-      delete all[mailid];
+    if(trulyChecked(item)){
+      if(!all[mailid]){
+        all[mailid]={mailid:mailid,sender:senderOf(item),subject:subjOf(item),
+                     time:timeOf(item),fulltext:(item.innerText||'').slice(0,400),
+                     ts:Date.now()};
+        saveAll(all);
+        // 勾选时立即尝试提取 Message-ID（异步）
+        try{
+          var _dm='';
+          var _a=['data-messageid','data-mid','data-msgid','data-message-id'];
+          for(var _i=0;_i<_a.length;_i++){var _v=item.getAttribute(_a[_i]);if(_v&&/xmmx/.test(_v)){_dm=_v;break;}}
+          if(!_dm){var _s=item.querySelector('[data-messageid],[data-mid],[data-msgid],[data-message-id]'); if(_s){_dm=_s.getAttribute('data-messageid')||_s.getAttribute('data-mid')||'';}}
+          if(_dm){saveMid(mailid,_dm);}
+          else if(!midMap()[mailid]){grabMsgID(mailid);}
+        }catch(e){}
+      }
     }else{
-      all[mailid]={mailid:mailid,sender:senderOf(item),subject:subjOf(item),
-                   time:timeOf(item),fulltext:(item.innerText||'').slice(0,400)};
+      if(all[mailid]){
+        delete all[mailid];
+        saveAll(all);
+      }
     }
-    saveAll(all);
-  }, true);
+  }
+  var _obs=new MutationObserver(function(muts){
+    for(var i=0;i<muts.length;i++){
+      var m=muts[i];
+      var t=m.target;
+      if(!t||t.nodeType!==1)continue;
+      if(m.type==='attributes'&&/class|checked|aria-checked|aria-selected/.test(m.attributeName||'')){
+        var it=itemOf(t);
+        if(it)syncItem(it);
+      }else if(m.type==='childList'){
+        for(var j=0;j<m.addedNodes.length;j++){
+          var n=m.addedNodes[j];
+          if(n.nodeType===1){var it2=itemOf(n);if(it2)syncItem(it2);}
+        }
+      }
+    }
+  });
+  function _startObserve(){
+    var root=document.querySelector('.mail_list')||document.querySelector('[class*=mail-list]')||document.body;
+    _obs.observe(root,{subtree:true,childList:true,attributes:true,
+                       attributeFilter:['class','checked','aria-checked','aria-selected']});
+  }
+  if(document.readyState==='complete')_startObserve();
+  else document.addEventListener('DOMContentLoaded',_startObserve);
 })();
 '''
 
@@ -445,6 +485,9 @@ class WebClient(QObject):
     checkedEls.push(el);
   }
   var stored=readAll();
+  // 会话起点：只合并本次页面加载后产生的记录（跨会话残留一律丢弃）
+  var sessStart=0;
+  try{sessStart=parseInt(localStorage.getItem('invoice_session_start')||'0',10)||0;}catch(e){}
   // 合并策略：
   //  - localStorage 记录 + DOM 中存在该项 → 用 DOM 当前勾选状态（勾选保留，取消丢弃）
   //  - localStorage 记录 + DOM 中无该项（滚出视图/翻页）→ 保留（用户主动勾选且无法核对取消）
@@ -462,6 +505,8 @@ class WebClient(QObject):
   for(var k in stored){
     var d=stored[k];
     if(!d||!d.mailid)continue;
+    // 跨会话残留防护：无时间戳或早于会话起点的记录视为残留，直接丢弃
+    if(!d.ts||!sessStart||d.ts<sessStart)continue;
     if(domAll[d.mailid]){
       // 在视口内：必须仍处于勾选状态才保留
       if(!domMailids[d.mailid])continue;  // 已取消勾选 → 丢弃
@@ -473,7 +518,10 @@ class WebClient(QObject):
   var out=[];
   for(var k2 in merged){out.push(merged[k2]);}
   // 读取后清空 localStorage 勾选记录：DOM 是实时真相源，残留记录会导致「取消勾选后仍被下载」。
-  try{localStorage.removeItem(KEY);}catch(e){}
+  try{
+    localStorage.removeItem(KEY);
+    localStorage.setItem('invoice_session_start', String(Date.now()));
+  }catch(e){}
   // 默认保留网页勾选；仅当 KEEP=false 时取消勾选
   if(!KEEP){
     var cbs=[];

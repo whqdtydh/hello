@@ -527,6 +527,8 @@ class ApiDownloadController:
         while self.process_next():
             pass
         self.log(f"🏁 全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
+        # 简单总结：读取到的邮件数量 + 下载的文件数量
+        self.log(f"📋 本次总结：读取邮件 {len(selected_mails)} 封，下载文件 {len(self.downloaded_files)} 个")
         self._archive_by_amount()
         return self.downloaded_files
 

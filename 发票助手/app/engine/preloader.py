@@ -12,6 +12,7 @@
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from app.engine import msgid_service
 from app.engine.api_downloader import QQMailApi
@@ -108,7 +109,7 @@ class Preloader:
                 self.log(f"后台预读：邮件列表缓存 {len(self._mail_cache)} 封")
         except Exception:
             pass
-        # 2) 轮询待预读队列（勾选 → 立即拉详情）
+        # 2) 轮询待预读队列（勾选 → 立即并发拉详情）
         while not self._stop.is_set():
             try:
                 pending = msgid_service.pending_preload()
@@ -119,18 +120,24 @@ class Preloader:
                 if self._api is None:
                     time.sleep(2)
                     continue
-                for mailid in pending:
-                    if self._stop.is_set():
-                        break
-                    with self._lock:
-                        hit = mailid in self._detail
-                    if hit:
-                        msgid_service.done_preload(mailid)
-                        continue
-                    item = self._api.fetch_readmail(mailid, func=1)
-                    if item:
-                        with self._lock:
-                            self._detail[mailid] = item
-                    msgid_service.done_preload(mailid)
+                # 多封并发预读（4 worker），跟上用户勾选速度
+                with ThreadPoolExecutor(max_workers=4, thread_name_prefix="pre") as ex:
+                    list(ex.map(self._preload_one, pending))
             except Exception:
                 time.sleep(1)
+
+    def _preload_one(self, mailid):
+        """单封邮件预读：命中缓存直接移除，否则拉详情入缓存。"""
+        try:
+            with self._lock:
+                hit = mailid in self._detail
+            if hit:
+                msgid_service.done_preload(mailid)
+                return
+            item = self._api.fetch_readmail(mailid, func=1)
+            if item:
+                with self._lock:
+                    self._detail[mailid] = item
+            msgid_service.done_preload(mailid)
+        except Exception:
+            pass

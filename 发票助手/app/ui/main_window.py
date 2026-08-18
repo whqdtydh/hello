@@ -15,7 +15,7 @@ import time
 import html
 
 from PySide6.QtCore import Qt, Signal, QTimer, QRect, QSize, QPoint
-from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QPixmap, QFont, QCursor, QBrush
+from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QPixmap, QFont, QCursor, QBrush, QKeySequence
 from PySide6.QtWebEngineCore import QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFileDialog,
     QTextEdit, QMessageBox, QTableWidget, QHeaderView,
     QCheckBox, QTableWidgetItem, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QAbstractItemView,
 )
 
 from app import config
@@ -438,7 +439,7 @@ class MainWindow(QWidget):
         # 渲染进程崩溃监控：记录崩溃原因与退出码，便于诊断闪退
         self.view.page().renderProcessTerminated.connect(self._on_render_crashed)
         self.web = WebClient(self.view)
-        self.web.log_signal.connect(lambda m: self._log(m, ""))
+        self.web.log_signal.connect(lambda m: None)  # 网页加载日志不进结果树
         self.web._install_tracker()
         wc_lay.addWidget(self.view, 1)
         cl.addWidget(self._web_card, 7)
@@ -641,10 +642,11 @@ class MainWindow(QWidget):
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
         v.addLayout(status_row)
-        # 结果树：每封勾选邮件一个分组（标题=结论），展开看详情
-        self.result_tree = QTreeWidget()
+        # 结果树：顶部总结 + 每封邮件一个分组（可 Ctrl+C 复制选中内容）
+        self.result_tree = _CopyableTree()
         self.result_tree.setHeaderHidden(True)
         self.result_tree.setIndentation(14)
+        self.result_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.result_tree.setStyleSheet(
             "QTreeWidget { background: rgba(255,255,255,0.40); border: 1px solid rgba(200,210,220,0.30); "
             "border-radius: 8px; color: #111827; font-size: 12px; }"
@@ -662,23 +664,36 @@ class MainWindow(QWidget):
             top = QTreeWidgetItem([msg])
             self._tree_map[group] = top
             self.result_tree.addTopLevelItem(top)
-            top.setForeground(0, QBrush(QColor("#6B7280")))
+            f = top.font(0)
+            f.setBold(True)
+            top.setFont(0, f)
+            top.setForeground(0, QBrush(QColor("#111827")))
+            if group == "__summary__":
+                self.result_tree.insertTopLevelItem(0, top)  # 总结固定置顶
             top.setExpanded(True)
+            return
+        if group == "__summary__":
+            # 顶部总结：随下载进度更新（检测邮件数 → 加 PDF 数 → 加总金额）
+            top.setText(0, msg)
             return
         if msg.startswith("[处理]"):
             top.setText(0, msg[len("[处理]"):].strip())
             top.setForeground(0, QBrush(QColor("#1E3A5F")))
             top.setExpanded(True)
         elif msg.startswith("[成功]"):
-            detail = msg[len("[成功]"):].strip()
-            top.setText(0, f"✓ {top.text(0)}  {detail}")
-            top.setForeground(0, QBrush(QColor("#059669")))
-            top.addChild(QTreeWidgetItem([detail]))
+            child = QTreeWidgetItem([msg[len("[成功]"):].strip()])
+            child.setForeground(0, QBrush(QColor("#059669")))
+            f = child.font(0)
+            f.setBold(True)
+            child.setFont(0, f)
+            top.addChild(child)
         elif msg.startswith("[失败]"):
-            detail = msg[len("[失败]"):].strip()
-            top.setText(0, f"✗ {top.text(0)}  {detail}")
-            top.setForeground(0, QBrush(QColor("#DC2626")))
-            top.addChild(QTreeWidgetItem([detail]))
+            child = QTreeWidgetItem([msg[len("[失败]"):].strip()])
+            child.setForeground(0, QBrush(QColor("#DC2626")))
+            f = child.font(0)
+            f.setBold(True)
+            child.setFont(0, f)
+            top.addChild(child)
         else:
             top.addChild(QTreeWidgetItem([msg]))
 
@@ -814,6 +829,20 @@ class MainWindow(QWidget):
     def _set_running(self, running):
         self._running = running
         self.start_btn.setEnabled(not running)
+
+
+class _CopyableTree(QTreeWidget):
+    """支持 Ctrl+C 复制选中条目文本的结果树。"""
+
+    def keyPressEvent(self, e):
+        if e.matches(QKeySequence.Copy):
+            items = self.selectedItems()
+            if items:
+                QApplication.clipboard().setText(
+                    "\n".join(it.text(0) for it in reversed(items)))
+                e.accept()
+                return
+        super().keyPressEvent(e)
 
 
 class _DummyProgress:

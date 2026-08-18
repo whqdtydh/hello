@@ -485,9 +485,9 @@ class ApiDownloadController:
         self._cur_group = ""                   # 当前处理邮件的日志分组
         self._processed_count = 0
 
-    def log(self, msg):
+    def log(self, msg, group=""):
         try:
-            self.on_log(msg, self._cur_group)
+            self.on_log(msg, group or self._cur_group)
         except TypeError:
             self.on_log(msg)
 
@@ -537,6 +537,7 @@ class ApiDownloadController:
             return []
         # 接口失效学习：运行前检查 failed 接口，尝试从网页观察记录更新路径
         self._maybe_learn_api()
+        self.log(f"检测到 {len(selected_mails)} 份邮件", "__summary__")
         self.prepare(selected_mails, sid=sid)
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mail") as pool:
             futures = [pool.submit(self._safe_process_one, m, i)
@@ -544,8 +545,11 @@ class ApiDownloadController:
             for f in futures:
                 f.result()
         self.log(f"全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
-        # 简单总结：读取到的邮件数量 + 下载的文件数量
-        self.log(f"本次总结：读取邮件 {len(selected_mails)} 封，下载文件 {len(self.downloaded_files)} 个")
+        # 顶部总结：检测邮件数 / 下载 PDF 数 / 总金额
+        self.log(
+            f"检测到 {len(selected_mails)} 份邮件，下载 {len(self.downloaded_files)} 个 PDF，"
+            f"总金额 {self._total_amount:.2f} 元（按可识别金额统计）",
+            "__summary__")
         self._archive_by_amount()
         return self.downloaded_files
 
@@ -953,7 +957,12 @@ class ApiDownloadController:
                 dest = tmp_path
             grant_current_user_access(dest)
             self.report_downloaded(dest)
-            mail_amounts.add(extract_amount_from_text(os.path.basename(dest)))
+            # 金额优先取 PDF 票面（价税合计等固定字段，最准），失败用文件名兜底
+            amt = self._amount_from_pdf(dest)
+            if amt <= 0:
+                amt = extract_amount_from_text(os.path.basename(dest))
+            if amt > 0:
+                mail_amounts.add(amt)
 
         # 清理临时目录
         try:
@@ -974,6 +983,44 @@ class ApiDownloadController:
                 doc.close()
         except Exception:
             return ""
+
+    def _amount_from_pdf(self, filepath):
+        """从 PDF 票面提取金额（普通发票「价税合计」是标准固定字段，最准）。
+
+        规则（按优先级）：
+        1. 价税合计 后的金额（跳过「（大写）…」段）
+        2. （小写）/小写 后的 ¥ 金额（增值税电子发票固定格式）
+        3. 合计/金额合计 后的金额
+        4. 票价 后的金额（高铁/铁路/行程单）
+        5. 兜底：票面所有 ¥/￥ 符号后的金额取最大值（价税合计通常是票面最大数字）
+        返回 float；提不到返回 0.0。
+        """
+        txt = self._pdf_text(filepath)
+        if not txt:
+            return 0.0
+        m = None
+        # 1) 价税合计 → 其后最近的数字（非贪婪跳过「（大写）壹佰贰拾叁元…」段）
+        m = re.search(r"价税合计[^0-9]{0,60}?[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt, re.S)
+        # 2) （小写）后的金额
+        if not m:
+            m = re.search(r"（?小写）?[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
+        # 3) 合计/金额合计
+        if not m:
+            m = re.search(r"(?:金额)?合计[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
+        # 4) 票价（铁路/行程单）
+        if not m:
+            m = re.search(r"票价[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
+        if m:
+            amt = float(m.group(1))
+            if 0 < amt < 1000000:
+                return amt
+        # 5) 兜底：所有 ¥/￥ 金额取最大值（价税合计通常是票面最大数字）
+        amounts = [float(x) for x in re.findall(r"[¥￥]\s*(\d+(?:\.\d{1,2})?)", txt)]
+        if amounts:
+            amt = max(amounts)
+            if 0 < amt < 1000000:
+                return amt
+        return 0.0
 
     def _consume_date_from_file(self, filepath):
         """从本地 PDF 文件提取消费日期。"""

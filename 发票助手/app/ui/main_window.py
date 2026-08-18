@@ -467,8 +467,7 @@ class MainWindow(QWidget):
             "border: none; padding: 5px; font-weight: 700; }")
         self._mail_table.cellClicked.connect(self._on_mail_row_click)
         mt.addWidget(self._mail_table, 1)
-        self._left_tabs.addTab(self._mail_tab, "邮件列表")
-        # Tab2：邮箱网页（登录 / 会话）
+        # Tab2：邮箱网页（登录 / 会话）— 默认显示，保持原来的网页勾选流程
         self.view = QWebEngineView(profile) if profile else QWebEngineView()
         self.view.setAttribute(Qt.WA_TranslucentBackground, True)
         self.view.page().setBackgroundColor(QColor(255, 255, 255))
@@ -476,6 +475,8 @@ class MainWindow(QWidget):
         # 渲染进程崩溃监控：记录崩溃原因与退出码，便于诊断闪退
         self.view.page().renderProcessTerminated.connect(self._on_render_crashed)
         self._left_tabs.addTab(self.view, "邮箱网页")
+        self._left_tabs.addTab(self._mail_tab, "邮件列表")
+        self._left_tabs.setCurrentIndex(0)  # 默认显示网页（原流程）
         self.web = WebClient(self.view)
         self.web.log_signal.connect(self._log)
         self.web._install_tracker()
@@ -895,9 +896,9 @@ class MainWindow(QWidget):
         url = config.MAIL_HOME
         self._set_status("加载邮箱…", "busy")
         self.web.navigate(url)
-        self._left_tabs.setCurrentIndex(1)
+        self._left_tabs.setCurrentIndex(0)
         self._log(f"已打开：{url}")
-        self._log("请登录 QQ 邮箱，然后切回「邮件列表」页签点「刷新列表」，在程序内勾选邮件。")
+        self._log("正在加载页面…请在左侧勾选需要下载的邮件（可进入 报销 文件夹）。")
 
     def on_start(self):
         if self._running:
@@ -934,16 +935,14 @@ class MainWindow(QWidget):
             pass
         self._log("读取勾选的邮件…")
         self._start_busy("读取勾选的邮件…")
-        mails = self._collect_selected_mails()
+        # 优先读取网页勾选（原流程）；为空时再尝试 API 列表勾选（备用）
+        mails = self.web.get_selected_mails()
         if not mails:
-            # 列表未加载或未勾选 → 自动尝试刷新列表后再收集
-            self._log("邮件列表为空，自动拉取最新邮件列表…")
-            self.on_refresh_list()
             mails = self._collect_selected_mails()
         if not mails:
             self._stop_busy()
             self._set_status("无勾选邮件", "error")
-            QMessageBox.warning(self, "提示", "没有勾选邮件。请先在「邮件列表」页签刷新列表，勾选要下载的邮件后重试。")
+            QMessageBox.warning(self, "提示", "没有检测到勾选的邮件。请在左侧网页勾选要下载的邮件（或到「邮件列表」页签勾选）。")
             self._running = False
             self.start_btn.setEnabled(True)
             return

@@ -615,21 +615,22 @@ class ApiDownloadController:
         self._cache_done = threading.Event()
         try:
             self.log("拉取邮件列表建立附件映射…")
-            # 同步只拉第 1 页（勾选邮件多在最新页），其余页全部后台拉，缩短等待
-            lst = self._api.fetch_maillist(page_now=0, page_size=50)
-            if not lst:
-                self._cache_done.set()
-            else:
+            for page in range(2):
+                lst = self._api.fetch_maillist(page_now=page, page_size=50)
+                if not lst:
+                    self._cache_done.set()
+                    break
                 self._merge_cache(lst)
                 if len(lst) < 50:
                     self._cache_done.set()
+                    break
         except Exception as e:
             self.log(f"  警告 拉取邮件列表失败: {str(e)[:60]}（将逐封查询）")
             self._cache_done.set()
         if not self._cache_done.is_set():
             def _fetch_rest():
                 try:
-                    for page in range(1, self._max_pages):
+                    for page in range(2, self._max_pages):
                         lst = self._api.fetch_maillist(page_now=page, page_size=50)
                         if not lst:
                             break

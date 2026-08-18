@@ -222,12 +222,12 @@ class WebClient(QObject):
   }
   document.addEventListener('click', function(e){
     var t=e.target;
-    var cb=t.closest?t.closest('.mail-checkbox,.xmail-ui-checkbox'):null;
-    if(!cb)return;
-    var item=cb.closest?cb.closest('div[class*=list-item]'):null;
-    if(!item)return;
+    // 扩大匹配范围：不仅匹配 checkbox 元素，还匹配点击发生在邮件项内且勾选状态变化的场景
+    var item=t.closest?t.closest('div[class*=list-item]'):null;
+    var cb=t.closest?t.closest('.mail-checkbox,.xmail-ui-checkbox,.checkbox,.check-box,.mail-check'):null;
+    if(!item) return;  // 不是邮件项内的点击，不处理
     var mailid=item.getAttribute('data-mailid')||'';
-    if(!mailid)return;
+    if(!mailid) return;
     // 勾选时立即尝试提取 Message-ID（异步）
     if(!midMap()[mailid]){
       // 优先从 DOM 属性直接抓（xmmx 开头），失败再走 readmail 接口
@@ -240,6 +240,13 @@ class WebClient(QObject):
       if(_dm){saveMid(mailid,_dm);}
       else{grabMsgID(mailid);}
     }
+    // 诊断：记录每次勾选操作到独立诊断 key，便于排查漏选问题
+    try{
+      var diag=JSON.parse(localStorage.getItem('invoice_diag')||'[]');
+      diag.push({mailid:mailid, ts:Date.now(), action:'click_on_item', has_cb:!!cb});
+      if(diag.length>50)diag=diag.slice(-50);
+      localStorage.setItem('invoice_diag',JSON.stringify(diag));
+    }catch(e){}
     var all=readAll();
     if(all[mailid]){
       delete all[mailid];
@@ -391,10 +398,15 @@ class WebClient(QObject):
   function trulyChecked(el){
     // 严格判定：只有出现明确的「已勾选」图标/标记才算勾选，
     // 避免 QQ 列表项的 active/current/selected/hover 类被误判。
+    // 增强匹配：覆盖 QQ 邮箱可能更新的多种勾选状态类名变体
     if(el.querySelector('.ui-checkbox-icon-checked'))return true;
-    if(el.querySelector('[class*="checkbox"][class*="checked"]'))return true;
-    if(el.querySelector('[aria-checked="true"]'))return true;
-    if(/mail-item-checked/.test(el.className||''))return true;
+    if(el.querySelector('.checkbox-checked, .checkbox-selected, .checked-icon'))return true;
+    if(el.querySelector('[class*="checkbox"][class*="checked"], [class*="checkbox"][class*="selected"]'))return true;
+    if(el.querySelector('[aria-checked="true"], [aria-selected="true"]'))return true;
+    if(/mail-item-checked|item-checked|selected-item|checked-row/.test(el.className||''))return true;
+    // 检查嵌套的 input[type=checkbox] 元素是否被选中（某些交互方式用 checkbox 元素）
+    var cb=el.querySelector('input[type="checkbox"]');
+    if(cb&&cb.checked)return true;
     return false;
   }
   function midOfItem(el){
@@ -471,6 +483,11 @@ class WebClient(QObject):
     }
     for(var c=0;c<cbs.length;c++){try{cbs[c].click();}catch(e){}}
   }
+  var diag={total_items:items.length, dom_checked:checkedEls.length,
+             stored_count:Object.keys(stored).length, merged_count:merged.length,
+             out_count:out.length, dom_all_count:Object.keys(domAll).length,
+             ts:Date.now()};
+  try{localStorage.setItem('invoice_diag_read',JSON.stringify(diag));}catch(e){}
   return JSON.stringify(out);
 })()
 """ % ("true" if keep_selection else "false")
@@ -497,6 +514,32 @@ class WebClient(QObject):
                 "message_id": (d.get("message_id", "") or "").strip(),
                 # text 保持与旧 list_mails 一致的「全文」结构，
                 # IMAP 侧用它做哈希/关键词/发件人特征提取
-                "text": fulltext or (subject + " " + sender),
+                "text": fulltext or (subject + " "+sender),
             })
+        # 差异诊断：读取本次扫描统计，计算勾选识别差异并输出到日志面板
+        try:
+            diag_raw = self.run_js(
+                "(function(){try{return localStorage.getItem('invoice_diag_read')||'{}';}catch(e){return '{}';}})()",
+                timeout=5000)
+            if isinstance(diag_raw, str) and diag_raw.startswith("__JS_ERR__"):
+                diag_raw = "{}"
+            import json
+            diag = json.loads(diag_raw) if isinstance(diag_raw, str) else {}
+            total_items = diag.get("total_items", 0)
+            dom_checked = diag.get("dom_checked", 0)
+            out_count = diag.get("out_count", len(mails))
+            stored_count = diag.get("stored_count", 0)
+            # 计算差异：如果用户勾选数（从日志判断或用户输入）与识别数不一致，提示可能原因
+            diff_note = ""
+            if out_count < dom_checked:
+                diff_note = "（部分勾选项被丢弃：可能已取消勾选或不在视口内）"
+            elif stored_count > 0 and out_count < stored_count + dom_checked:
+                diff_note = "（localStorage 记录与 DOM 扫描存在重叠或缺失）"
+            msg = f"📊 勾选识别诊断 → 总项:{total_items} DOM勾选:{dom_checked} 识别结果:{out_count} localStorage记录:{stored_count}{diff_note}"
+            try:
+                self.log_signal.emit(msg)
+            except Exception:
+                pass
+        except Exception:
+            pass
         return mails

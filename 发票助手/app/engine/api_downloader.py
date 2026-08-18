@@ -537,7 +537,8 @@ class ApiDownloadController:
     def run(self, selected_mails, sid=None):
         """selected_mails: 用户勾选的邮件 [{mailid, subject, sender, text}]
         sid: 可选，GUI 线程已取好的会话 sid。
-        多封邮件并发处理（2 worker），附件内部再并行下载（4 worker）。"""
+        多封邮件并发处理（3 worker），附件内部再并行下载（6 worker）。"""
+        t_start = time.time()
         os.makedirs(self.save_dir, exist_ok=True)
         if not selected_mails:
             self.log("没有检测到勾选的邮件。")
@@ -546,12 +547,13 @@ class ApiDownloadController:
         self._maybe_learn_api()
         self.log(f"应下载 {len(selected_mails)} 封邮件", "__summary_1")
         self.prepare(selected_mails, sid=sid)
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="mail") as pool:
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="mail") as pool:
             futures = [pool.submit(self._safe_process_one, m, i)
                        for i, m in enumerate(selected_mails)]
             for f in futures:
                 f.result()
         self.log(f"全部完成，共下载 {len(self.downloaded_files)} 个 PDF → {self.save_dir}")
+        self.log(f"总耗时 {time.time() - t_start:.1f} 秒")
         # 顶部总结（拆两行避免超长截断）：
         # 行1：应下载邮件数 / 下载 PDF 数 / 总金额 / 行程单 / 失败
         # 行2：类型分布 / 待确认日期
@@ -575,6 +577,7 @@ class ApiDownloadController:
         return self.downloaded_files
 
     def _safe_process_one(self, m, i):
+        t0 = time.time()
         try:
             self._process_one(m, i)
         except Exception as e:
@@ -583,6 +586,7 @@ class ApiDownloadController:
             with self._lock:
                 self._processed_count += 1
                 self.on_progress(self._processed_count, self._total, self.downloaded_pdf_count)
+            self.log(f"  耗时 {time.time() - t0:.1f} 秒", f"mail_{i}")
 
     def _archive_by_amount(self):
         """下载完成后按合计金额归档：建「xx.xx元」子文件夹，把已下载 PDF 移入。"""
@@ -908,7 +912,7 @@ class ApiDownloadController:
 
         results = []
         if attach_urls:
-            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="att") as ex:
+            with ThreadPoolExecutor(max_workers=6, thread_name_prefix="att") as ex:
                 results = list(ex.map(_dl_one, attach_urls))
         for res in results:
             if not res:

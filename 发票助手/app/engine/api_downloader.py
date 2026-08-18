@@ -553,7 +553,7 @@ class ApiDownloadController:
         # 顶部总结（拆两行避免超长截断）：
         # 行1：应下载邮件数 / 下载 PDF 数 / 总金额 / 行程单 / 失败
         # 行2：类型分布 / 待确认日期
-        summary = (f"应下载 {len(selected_mails)} 封邮件，下载 {len(self.downloaded_files)} 个 PDF，"
+        summary = (f"应下载 {len(selected_mails)} 封邮件，{len(self.downloaded_files)} 个 PDF，"
                    f"总金额 {self._total_amount:.2f} 元")
         if self._itinerary_mails:
             summary += f"，含行程单 {self._itinerary_mails} 封"

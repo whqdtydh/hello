@@ -567,7 +567,12 @@ class MainWindow(QWidget):
         row = QHBoxLayout()
         row.setSpacing(6)
         self.dir_edit = QLineEdit(config.DEFAULT_SAVE_DIR)
-        self.dir_edit.setStyleSheet(self.dir_edit.styleSheet() + " border-radius: 8px;")
+        # 边框加深加粗 + 路径字体加粗，便于查看
+        self.dir_edit.setStyleSheet(
+            "QLineEdit { background: rgba(255,255,255,0.75); "
+            "border: 2px solid #111827; border-radius: 8px; "
+            "padding: 8px 12px; color: #111827; font-size: 12px; font-weight: 700; "
+            "selection-background-color: #1E3A5F; selection-color: white; }")
         row.addWidget(self.dir_edit, 1)
         browse_btn = QPushButton("浏览")
         browse_btn.setMinimumHeight(32)

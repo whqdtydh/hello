@@ -31,6 +31,7 @@ from app.engine.archive_service import (
 )
 from app.engine.mail_parse import invoice_kind, consume_date, kind_from_pdf
 from app.engine import pdf_service
+from app.engine.task_store import TaskStore
 from app.engine.web_client import WebClient
 
 
@@ -378,13 +379,15 @@ class ApiDownloadController:
       更新注册表后，用新接口路径继续下载。
     """
 
-    def __init__(self, client: WebClient, save_dir, on_log=None, on_progress=None, preloader=None):
+    def __init__(self, client: WebClient, save_dir, on_log=None, on_progress=None, preloader=None,
+                 store=None):
         self.client = client
         self.save_dir = save_dir
         self.on_log = on_log or (lambda m, g="": None)
         self.on_progress = on_progress or (lambda p, t, d: None)
         self.registry = ApiRegistry()
         self._preloader = preloader  # 边勾边读缓存（可选）
+        self._store = store or TaskStore()  # 任务状态机（幂等/崩溃恢复/审计）
 
         self.downloaded_files = []
         self.downloaded_pdf_count = 0
@@ -455,6 +458,13 @@ class ApiDownloadController:
         if not selected_mails:
             self.log("没有检测到勾选的邮件。")
             return []
+        # 崩溃恢复：清理上次进程中断残留的临时文件，失败任务可重新勾选下载
+        try:
+            cleaned = self._store.cleanup_interrupted()
+            if cleaned:
+                self.log(f"  清理上次中断残留 {cleaned} 个临时文件")
+        except Exception as e:
+            self.log(f"  任务库恢复异常: {str(e)[:60]}")
         # 接口失效学习：运行前检查 failed 接口，尝试从网页观察记录更新路径
         self._maybe_learn_api()
         self.log(f"应下载 {len(selected_mails)} 封邮件", "__summary_1")
@@ -490,6 +500,14 @@ class ApiDownloadController:
             sub.append(f"待确认日期 {self._pending_count} 个")
         if sub:
             self.log(" · ".join(sub), "__summary_2")
+        # 审计：最近归档文件的金额/日期提取率（驱动规则改进）
+        try:
+            st = self._store.extract_stats()
+            if st["total"]:
+                self.log(f"  审计 近{st['total']}个文件提取率：金额 {st['amount_ok']} ({st['amount_rate']*100:.0f}%)"
+                         f"，日期 {st['date_ok']} ({st['date_rate']*100:.0f}%)")
+        except Exception:
+            pass
         self._archive_by_amount()
         return self.downloaded_files
 
@@ -524,6 +542,10 @@ class ApiDownloadController:
             except Exception:
                 pass
         self.log(f"  已新建文件夹「{os.path.basename(sub)}」，移入 {moved} 个 PDF")
+        try:
+            self._store.archive_record(os.path.basename(sub), self._total_amount, moved)
+        except Exception:
+            pass
 
     def prepare(self, selected_mails, sid=None):
         """初始化处理队列。必须在 GUI 线程调用（读取 cookie）。sid 可选（GUI 线程已取好）。
@@ -596,6 +618,10 @@ class ApiDownloadController:
         subject = m.get("subject", "") or m.get("text", "")[:60]
         text = m.get("text", "") or subject
         sender = m.get("sender", "") or m.get("from", "") or ""
+        try:
+            self._store.mail_start(mailid, subject, sender)
+        except Exception:
+            pass
         self._cur_group = f"mail_{processed}"
         self.log(f"[处理] {subject[:40]}")
 
@@ -634,7 +660,7 @@ class ApiDownloadController:
             # 2) 附件型：readmail 返回里没有附件，需从 maillist 拿
             attach_urls = self._get_attach_urls(mailid)
             if attach_urls:
-                mail_amounts = self._download_attaches(attach_urls, subject, date_str, text, sender)
+                mail_amounts = self._download_attaches(attach_urls, subject, date_str, text, sender, mailid)
                 with self._lock:
                     now_count = self.downloaded_pdf_count
                 if now_count > before:
@@ -702,8 +728,18 @@ class ApiDownloadController:
                 self.log("[失败] 未下载到文件")
                 with self._lock:
                     self._failed_mails += 1
+                try:
+                    self._store.mail_finish(mailid, ok=False, reason="未下载到文件")
+                except Exception:
+                    pass
             else:
                 self.log(f"[成功] 下载文件 {now_count - before} 个")
+                try:
+                    self._store.mail_finish(
+                        mailid, total_amount=self._total_amount,
+                        files_count=now_count - before, ok=True)
+                except Exception:
+                    pass
             self._cur_group = ""
 
     def _mark_failed(self, subject, date_str, sender):
@@ -769,12 +805,12 @@ class ApiDownloadController:
                 with open(pending, "a", encoding="utf-8") as f:
                     if mode == "w":
                         f.write("以下文件命名日期来自邮件日期，可能不是消费当天，请核对后手动改名：\n\n")
-                    for tmp_path, kind, orig_name in temp_pdfs:
+                    for tmp_path, kind, orig_name, _url in temp_pdfs:
                         f.write(f"  {os.path.basename(tmp_path)}  ({kind})\n")
             except Exception:
                 pass
 
-    def _download_attaches(self, attach_urls, subject, date_str, text, sender=""):
+    def _download_attaches(self, attach_urls, subject, date_str, text, sender="", mailid=""):
         """下载附件型发票（PDF/zip）。zip 附件解压后提取 PDF。
 
         两阶段策略：
@@ -783,6 +819,8 @@ class ApiDownloadController:
 
         日期优先级（行程单优先）：行程单票面日期（= 消费当天，最准）
         > 其他 PDF 票面日期（高速发票票面有通行时间）> 正文日期 > 邮件日期。
+
+        mailid: 来源邮件（任务状态机记录用）。
         """
         import tempfile, shutil
 
@@ -799,9 +837,15 @@ class ApiDownloadController:
             self.log(f"  去重: {len(attach_urls)} → {len(unique_urls)} 个附件")
         attach_urls = unique_urls
 
+        # 幂等：已成功归档过的 URL 不再重复下载
+        skip = [u for u in attach_urls if self._store.has_archived_url(u)]
+        if skip:
+            self.log(f"  跳过已下载过 {len(skip)} 个附件（任务库记录）")
+            attach_urls = [u for u in attach_urls if u not in skip]
+
         # ---- 阶段1：并发下载到临时目录 ----
         tmp_dir = tempfile.mkdtemp(prefix="fapiao_")
-        temp_pdfs = []  # [(临时路径, kind, 原始文件名)]
+        temp_pdfs = []  # [(临时路径, kind, 原始文件名, url)]
         self.log(f"  附件 {len(attach_urls)} 个，并行下载…")
 
         def _dl_one(u):
@@ -822,10 +866,18 @@ class ApiDownloadController:
             self.log(f"  下载 {name or '附件'}…")
             if not self._api.download_attach(u, tmp_path, session=self._new_session()):
                 self.log(f"  下载失败 {name}")
+                try:
+                    self._store.file_fail(u, reason="下载失败")
+                except Exception:
+                    pass
                 return None
+            try:
+                self._store.file_start(u, mailid, subject, tmp_path)
+            except Exception:
+                pass
             dl_ok = os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0
             self.log(f"  写入 {os.path.basename(tmp_path)} ok={dl_ok} size={os.path.getsize(tmp_path) if dl_ok else 0}")
-            return (tmp_path, kind, name)
+            return (tmp_path, kind, name, u)
 
         results = []
         if attach_urls:
@@ -834,7 +886,7 @@ class ApiDownloadController:
         for res in results:
             if not res:
                 continue
-            tmp_path, kind, name = res
+            tmp_path, kind, name, url = res
             if self._is_zip(tmp_path):
                 self.log("  解压 PDF…")
                 amount_hint = f"{extract_amount_from_text(name):.2f}元" if extract_amount_from_text(name) else ""
@@ -843,10 +895,10 @@ class ApiDownloadController:
                     os.remove(tmp_path)
                 except Exception:
                     pass
-                for p in extracted:
-                    temp_pdfs.append((p, kind, os.path.basename(p)))
+                for i, p in enumerate(extracted):
+                    temp_pdfs.append((p, kind, os.path.basename(p), f"{url}#{i}"))
             else:
-                temp_pdfs.append((tmp_path, kind, name))
+                temp_pdfs.append((tmp_path, kind, name, u))
 
         # ---- 阶段1.5：提取消费日期（行程单优先）+ 用 PDF 票面识别修正发票类型 ----
         rail_infos = {}  # tmp_path → railway_info（高铁 PDF 专用）
@@ -854,7 +906,7 @@ class ApiDownloadController:
         itinerary_dates = []  # 行程单票面日期（消费当天，最准）
         pdf_dates = {}  # tmp_path → 票面日期
         self.log(f"  临时文件 {len(temp_pdfs)} 个")
-        for tmp_path, kind, orig_name in temp_pdfs:
+        for tmp_path, kind, orig_name, _url in temp_pdfs:
             exists = os.path.exists(tmp_path)
             sz = os.path.getsize(tmp_path) if exists else 0
             self.log(f"  [{kind}] {orig_name} size={sz}")
@@ -899,15 +951,20 @@ class ApiDownloadController:
         # ---- 阶段2：用共享日期命名，移动到目标目录 ----
         mail_amounts = set()
         self.log(f"  保存 {len(temp_pdfs)} 个文件")
-        for tmp_path, kind, orig_name in temp_pdfs:
+        for tmp_path, kind, orig_name, url in temp_pdfs:
             if self.stop_flag:
                 break
             if not os.path.exists(tmp_path):
                 self.log(f"  跳过不存在: {tmp_path}")
+                try:
+                    self._store.file_fail(url, reason="临时文件缺失")
+                except Exception:
+                    pass
                 continue
             kind = pdf_kinds.get(tmp_path, kind)  # 票面识别结果优先
             # 票面金额优先用于命名（价税合计/行程单总计，比正文/附件名准）
             pdf_amt = self._amount_from_pdf(tmp_path)
+            trip_date = pdf_dates.get(tmp_path, "")
             fname = build_filename(kind, orig_name, shared_date, msg=text,
                                    rw=rail_infos.get(tmp_path), amt=pdf_amt)
             dest = unique_path(self.save_dir, fname)
@@ -929,6 +986,19 @@ class ApiDownloadController:
             if "行程单" not in kind:
                 with self._lock:
                     self._kind_counts[kind] = self._kind_counts.get(kind, 0) + 1
+            # 任务状态机：记录归档完成（sha256 + 提取结果，供审计/幂等）
+            try:
+                import hashlib
+                h = hashlib.sha256()
+                with open(dest, "rb") as f:
+                    for chunk in iter(lambda: f.read(65536), b""):
+                        h.update(chunk)
+                self._store.file_finish(url, dest, sha256=h.hexdigest(),
+                                        size=os.path.getsize(dest),
+                                        amount=amt or None, trip_date=trip_date,
+                                        kind=kind)
+            except Exception:
+                pass
 
         # 清理临时目录
         try:

@@ -11,6 +11,7 @@
   - 51fapiao 链接型：checkDownloadPermissions -> downloadFile           -> 发票 PDF
 """
 
+import hashlib
 import json
 import os
 import re
@@ -300,6 +301,8 @@ class QQMailApi:
                            "Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
             "Referer": "https://wx.mail.qq.com/home/index",
         })
+        # 全局限流：邮件级 worker × 附件级 worker 叠加时统一压并发，防风控
+        self._download_slots = threading.BoundedSemaphore(6)
 
     # ---------- 接口路径（注册表优先） ----------
     def _ep_path(self, name):
@@ -441,23 +444,92 @@ class QQMailApi:
             return False
 
     def _download(self, url, dest_path, extra_headers=None, session=None):
-        """下载 URL 内容到 dest_path。返回 True/False。session 可选（并发时用独立会话）。"""
+        """下载 URL 内容到 dest_path（原子落盘）。
+
+        流程：全局限流（信号量）→ 流式写入 dest_path.part → 内容校验
+        （PDF/zip 可打开、大小>0）→ os.replace 原子改名到 dest_path。
+        失败分类处理：429/5xx 指数退避重试，超时/连接错误小退避重试，
+        4xx 不重试（接口级问题走 _mark_failed 学习流程）。
+        返回 True/False。
+        """
+        part = dest_path + ".part"
         try:
-            s = session or self.session
-            headers = dict(s.headers)
-            if extra_headers:
-                headers.update(extra_headers)
-            with s.get(url, headers=headers, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
-                with open(dest_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=65536):
-                        f.write(chunk)
-            grant_current_user_access(dest_path)
-            return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+            with self._download_slots:  # 全局限流
+                s = session or self.session
+                headers = dict(s.headers)
+                if extra_headers:
+                    headers.update(extra_headers)
+                attempts = 0
+                while True:
+                    attempts += 1
+                    try:
+                        with s.get(url, headers=headers, stream=True, timeout=60) as r:
+                            code = r.status_code
+                            if code in (429, 503) or code >= 500:
+                                if attempts <= 5:
+                                    wait = min(2 ** (attempts + 1), 32)
+                                    self.on_log(
+                                        f"  限流/服务端错误 {code}，{wait}s 后重试 ({attempts}/5)")
+                                    time.sleep(wait)
+                                    continue
+                                return False
+                            r.raise_for_status()
+                            os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
+                            h = hashlib.sha256()
+                            with open(part, "wb") as f:
+                                for chunk in r.iter_content(chunk_size=65536):
+                                    f.write(chunk)
+                                    h.update(chunk)
+                            if os.path.getsize(part) <= 0:
+                                self.on_log(f"  下载内容为空 {os.path.basename(dest_path)}")
+                                return False
+                            if not self._verify_archive(part):
+                                self.on_log(f"  内容校验失败 {os.path.basename(dest_path)}")
+                                return False
+                            os.replace(part, dest_path)  # 原子改名，不留半成品
+                            grant_current_user_access(dest_path)
+                            return True
+                    except requests.Timeout:
+                        if attempts <= 3:
+                            wait = min(2 ** attempts, 16)
+                            self.on_log(f"  下载超时，{wait}s 后重试 ({attempts}/3)")
+                            time.sleep(wait)
+                            continue
+                        raise
+                    except requests.ConnectionError:
+                        if attempts <= 3:
+                            self.on_log(f"  连接异常，2s 后重试 ({attempts}/3)")
+                            time.sleep(2)
+                            continue
+                        raise
         except Exception as e:
             self.on_log(f"警告 下载失败 {os.path.basename(dest_path)}: {str(e)[:80]}")
             return False
+        finally:
+            try:
+                if os.path.exists(part):
+                    os.remove(part)  # 失败残留清理
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _verify_archive(path):
+        """内容完整性校验：PDF 能被 PyMuPDF 打开且有页，zip 能打开。未知扩展名不校验。"""
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".pdf":
+                import pymupdf
+                doc = pymupdf.open(path)
+                ok = doc.page_count > 0
+                doc.close()
+                return ok
+            if ext == ".zip":
+                import zipfile
+                return zipfile.is_zipfile(path)
+        except Exception:
+            return False
+        return True
 
 
 # ---------- 控制器 ----------

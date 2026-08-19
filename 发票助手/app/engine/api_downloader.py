@@ -22,184 +22,19 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from app import config
 from app.engine.acl_util import grant_current_user_access
 from app.engine.api_registry import ApiRegistry
-from app.engine.mail_parse import invoice_kind, ticket_amount, consume_date, kind_from_pdf
+from app.engine.archive_service import (
+    build_filename, date_label, extract_amount_from_text, failed_folder_name,
+    is_invoice_mail, parse_original_name, rename_dir_with_amount, unique_dir,
+    unique_path,
+)
+from app.engine.mail_parse import invoice_kind, consume_date, kind_from_pdf
+from app.engine import pdf_service
 from app.engine.web_client import WebClient
 
 
-# ---------- 纯函数：命名解析（复用 downloader 逻辑） ----------
-
-def is_invoice_mail(item_text):
-    """根据邮件正文判断是否发票邮件。"""
-    if any(kw in item_text for kw in config.SKIP_KEYWORDS):
-        return False
-    low = item_text.lower()
-    if any(kw in low for kw in config.INVOICE_FROM_KEYWORDS):
-        return True
-    return "发票" in item_text or "行程单" in item_text
-
-
-def date_label(date_str):
-    """把 2026-08-06 简化为 8.6号。"""
-    try:
-        parts = date_str.split("-")
-        return f"{int(parts[1])}.{int(parts[2])}号"
-    except Exception:
-        return ""
-
-
-def _cn_date_to_iso(cn):
-    """把 2026年08月06日 转为 2026-08-06，失败返回空串。"""
-    try:
-        m = re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", cn or "")
-        if not m:
-            return ""
-        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    except Exception:
-        return ""
-
-
-def parse_original_name(display_name):
-    company, amount = "", ""
-    m_company = re.search(r"【([^】]*)】", display_name)
-    if m_company:
-        raw = m_company.group(1)
-        company = re.split(r"-\d+(?:\.\d+)?元", raw)[0].strip(" -")
-    # 金额：兼容「33.00元」「金额为33.00的」「33.00元的」等多种写法
-    m_amount = re.search(r"(\d+(?:\.\d+)?)元|金额(?:为|是)?(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)的电子发票", display_name)
-    if m_amount:
-        amount = next((g for g in m_amount.groups() if g), "") or ""
-    return company, amount
-
-
-def _month_date_label(date_str):
-    """把 2026-08-11 简化为 8月11（无「号」字）。"""
-    try:
-        parts = date_str.split("-")
-        return f"{int(parts[1])}月{int(parts[2])}"
-    except Exception:
-        return ""
-
-
-def build_filename(kind, display_name, date_str, msg=None, rw=None, amt=None):
-    """简化命名：8.6号_发票_31.27.pdf / 8.6号_行程单_31.27.pdf / 8.6号_高速发票_21.00.pdf /
-    8.6号_打车发票_82.94.pdf；高铁：8月9_高铁_上海虹桥-杭州东_120.00.pdf
-
-    规则：所有文件命名必须标注价格；提取不到金额时标注「未识别出金额」。
-    amt: PDF 票面金额（float），最准，优先于附件名/正文金额。
-    """
-    company, amount = parse_original_name(display_name)
-    no_amount_label = "未识别出金额"
-    if "高铁" in kind:
-        if rw:
-            date_part = _month_date_label(rw.get("date") or rw.get("issue_date") or date_str)
-            route = rw.get("route", "")
-            amt_v = rw.get("amount")
-            amt_label = f"{amt_v:.2f}" if amt_v else no_amount_label
-            parts = [p for p in [date_part, "高铁", route, amt_label] if p]
-            if parts:
-                return "_".join(parts) + ".pdf"
-        label = "高铁发票"
-    elif "行程单" in kind:
-        label = "行程单"
-    elif "发票" in kind:
-        label = kind
-    else:
-        label = kind
-    if amt is not None and amt > 0:
-        amount = f"{amt:.2f}"  # 票面金额优先（价税合计，最准）
-    elif not amount and msg is not None:
-        try:
-            amt2 = ticket_amount(msg)
-            if amt2:
-                amount = f"{amt2:.2f}"
-        except Exception:
-            pass
-    parts = [date_label(date_str), label]
-    # 强制标注价格：提取不到则标注「未识别出金额」
-    parts.append(amount if amount else no_amount_label)
-    return "_".join(p for p in parts if p) + ".pdf"
-
-
-def unique_path(dest_dir, filename):
-    base, ext = os.path.splitext(filename)
-    cand = os.path.join(dest_dir, filename)
-    n = 1
-    while os.path.exists(cand):
-        cand = os.path.join(dest_dir, f"{base}_{n}{ext}")
-        n += 1
-    return cand
-
-
-def _sanitize_folder_name(name, max_len=40):
-    """清理文件夹名中的非法字符并截断。"""
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    if len(name) > max_len:
-        name = name[:max_len].rstrip(" ._")
-    return name or "未命名"
-
-
-def failed_folder_name(subject, date_str="", sender=""):
-    """失败标记文件夹名：日期 + 主题摘要 + 发件人（简短，可作文件夹名）。
-
-    例：8.6号_【电子发票】上海华铁旅客服务…_dzfp@51fapiao.cloud
-    """
-    parts = []
-    if date_str:
-        parts.append(date_label(date_str))
-    subj = _sanitize_folder_name(subject or "", max_len=30)
-    if subj:
-        parts.append(subj)
-    if sender:
-        parts.append(_sanitize_folder_name(sender, max_len=20))
-    return "_".join(parts) if parts else "未下载邮件"
-
-
-def unique_dir(dest_dir, folder_name):
-    """避免文件夹名冲突：同名则追加 _1/_2。"""
-    cand = os.path.join(dest_dir, folder_name)
-    n = 1
-    while os.path.exists(cand):
-        cand = os.path.join(dest_dir, f"{folder_name}_{n}")
-        n += 1
-    return cand
-
-
-def extract_amount_from_text(text):
-    """从文本（附件名/主题/文件名）提取金额。兼容「82.94元」「金额为33.00的」
-    「33.00元」以及文件名格式「6.15号_打车发票_19.96.pdf」「..._19.96_1.pdf」。
-
-    返回 float 或 0.0。
-    """
-    if not text:
-        return 0.0
-    m = re.search(r"(\d+(?:\.\d+)?)元|金额(?:为|是)?(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)的电子发票", text)
-    if not m:
-        # 兜底：文件名格式（label 后的金额，可选 _N 去重后缀）
-        m = re.search(r"_(\d+(?:\.\d+)?)(?:_\d+)?\.pdf$", text)
-    if not m:
-        return 0.0
-    val = next((g for g in m.groups() if g), "")
-    try:
-        v = float(val)
-        # 金额上限保护：订单号/发票号等长数字（如 26339190041008832512）误入时归 0
-        return v if 0 < v < 999999 else 0.0
-    except (ValueError, TypeError):
-        return 0.0
-
-
-def rename_dir_with_amount(dir_path, amount):
-    """在保存目录下新建子文件夹「总金额元」，把文件移入。返回子文件夹路径。"""
-    sub = os.path.join(dir_path, f"{amount:.2f}元")
-    try:
-        os.makedirs(sub, exist_ok=True)
-    except Exception:
-        return dir_path
-    return sub
-
+# ---------- 链接提取 ----------
 
 # ---------- 链接提取 ----------
 
@@ -1104,136 +939,24 @@ class ApiDownloadController:
         return mail_amounts
 
     def _pdf_text(self, filepath):
-        """读取 PDF 全文文本，失败返回空串。"""
-        try:
-            import pymupdf  # PyMuPDF
-            doc = pymupdf.open(filepath)
-            try:
-                return "".join(page.get_text() or "" for page in doc)
-            finally:
-                doc.close()
-        except Exception:
-            return ""
+        """读取 PDF 全文文本，失败返回空串。（转发 pdf_service）"""
+        return pdf_service.pdf_text(filepath)
 
     def _amount_from_pdf(self, filepath):
-        """从 PDF 票面提取金额（普通发票「价税合计」是标准固定字段，最准）。
-
-        规则（按优先级）：
-        1. 价税合计 后的金额（跳过「（大写）…」段）
-        2. （小写）/小写 后的 ¥ 金额（增值税电子发票固定格式）
-        3. 总计/合计/金额合计 后的金额（货拉拉/滴滴行程单：总计178.79元）
-        4. 票价 后的金额（高铁/铁路/行程单）
-        5. 兜底：票面所有 ¥/￥ 符号后的金额取最大值（价税合计通常是票面最大数字）
-        返回 float；提不到返回 0.0。
-        """
-        txt = self._pdf_text(filepath)
-        if not txt:
-            return 0.0
-        m = None
-        # 1) 价税合计 → 其后最近的数字（非贪婪跳过「（大写）壹佰贰拾叁元…」段）
-        m = re.search(r"价税合计[^0-9]{0,60}?[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt, re.S)
-        # 2) （小写）后的金额
-        if not m:
-            m = re.search(r"（?小写）?[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-        # 3) 总计（货拉拉/滴滴行程单：总计178.79元）/ 合计 / 金额合计
-        if not m:
-            m = re.search(r"总计[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-        if not m:
-            m = re.search(r"(?:金额)?合计[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-        # 4) 票价（铁路/行程单）
-        if not m:
-            m = re.search(r"票价[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-        if m:
-            amt = float(m.group(1))
-            if 0 < amt < 1000000:
-                return amt
-        # 5) 兜底：所有 ¥/￥ 金额取最大值（价税合计通常是票面最大数字）
-        amounts = [float(x) for x in re.findall(r"[¥￥]\s*(\d+(?:\.\d{1,2})?)", txt)]
-        if amounts:
-            amt = max(amounts)
-            if 0 < amt < 1000000:
-                return amt
-        return 0.0
+        """从 PDF 票面提取金额（转发 pdf_service，规则见 pdf_service.amount_from_pdf）。"""
+        return pdf_service.amount_from_pdf(filepath)
 
     def _consume_date_from_file(self, filepath):
-        """从本地 PDF 文件提取消费日期。"""
-        try:
-            with open(filepath, "rb") as f:
-                data = f.read()
-            d = self._consume_date_from_pdf(data)
-            if not d:
-                self.log(f"    PyMuPDF未提取到日期: {os.path.basename(filepath)}")
-            return d
-        except Exception as e:
-            self.log(f"    读取PDF失败: {str(e)[:60]}")
-            return ""
+        """从本地 PDF 文件提取消费日期。（转发 pdf_service）"""
+        return pdf_service.consume_date_from_file(filepath, log=self.log)
 
     def _consume_date_from_pdf(self, data):
-        """从 PDF 二进制内容提取消费日期（行程时间/通行时间/出行日期/上车时间）。
-
-        使用 PyMuPDF 提取文本（轻量、无重依赖，避免 pdfplumber 引入 pandas 全家桶）。
-        """
-        if not data:
-            return ""
-        try:
-            import pymupdf  # PyMuPDF
-            doc = pymupdf.open(stream=data, filetype="pdf")
-            try:
-                for page in doc:
-                    t = page.get_text() or ""
-                    d = consume_date(t)
-                    if d:
-                        return d
-            finally:
-                doc.close()
-        except Exception:
-            pass
-        return ""
+        """从 PDF 二进制内容提取消费日期。（转发 pdf_service）"""
+        return pdf_service.consume_date_from_pdf(data)
 
     def _railway_info_from_pdf(self, filepath):
-        """从铁路电子客票 PDF 提取乘车信息（乘车日期/开票日期/车次/路线/票价）。
-
-        12306 铁路电子客票 PDF 有两种文本布局：
-          A) 车次与日期相邻 + 票价同行：G258\n2026年08月06日 / 票价:￥87.00
-          B) 车次与日期隔英文站名 + 票价分离：G901\nShanghaihongqiao\nHangzhouxi\n
-             2026年08月09日 / 票价:\n...\n￥120.00（金额独立行）
-        返回 dict：{date, issue_date, train, route, amount}，提取不到为空串/0。
-        """
-        info = {"date": "", "issue_date": "", "train": "", "route": "", "amount": 0.0}
-        try:
-            t = self._pdf_text(filepath)
-            if not t:
-                return info
-            # 票价：优先「票价:￥87.00」同行；否则找独立「￥120.00」金额行
-            m = re.search(r"票价[：:\s]*[¥￥]?\s*(\d+(?:\.\d+)?)", t)
-            if not m:
-                m = re.search(r"[¥￥]\s*(\d+(?:\.\d+)?)", t)
-            if m:
-                try:
-                    info["amount"] = float(m.group(1))
-                except ValueError:
-                    pass
-            # 车次：任意 [A-Z]1-4 位数字（如 G258 / G901）
-            m = re.search(r"([A-Z]\d{1,4})", t)
-            if m:
-                info["train"] = m.group(1)
-            # 乘车日期：独立匹配「20xx年x月x日」，排除开票日期行
-            # （先剔除开票日期段，避免把开票日期当乘车日期）
-            rest = re.sub(r"开票日期[：:\s]*20\d{2}年\d{1,2}月\d{1,2}日", "", t)
-            m = re.search(r"(20\d{2}年\d{1,2}月\d{1,2}日)", rest)
-            if m:
-                info["date"] = _cn_date_to_iso(m.group(1))
-            # 开票日期
-            m = re.search(r"开票日期[：:\s]*(20\d{2}年\d{1,2}月\d{1,2}日)", t)
-            if m:
-                info["issue_date"] = _cn_date_to_iso(m.group(1))
-            # 路线：两个「xxx站」
-            stations = re.findall(r"[\u4e00-\u9fa5]{2,6}站", t)
-            if len(stations) >= 2:
-                info["route"] = f"{stations[0]}-{stations[1]}"
-        except Exception:
-            pass
-        return info
+        """从铁路电子客票 PDF 提取乘车信息（转发 pdf_service）。"""
+        return pdf_service.railway_info_from_pdf(filepath)
 
     def _rename_with_date(self, filepath, new_date):
         """用新日期重命名文件，返回新路径。"""

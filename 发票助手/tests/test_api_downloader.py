@@ -54,11 +54,11 @@ class TestBuildFilename:
 
     def test_itinerary(self):
         name = build_filename("行程单", "行程单.pdf", "2026-08-11")
-        assert name == "8.11号_行程单_0.00.pdf"
+        assert name == "8.11号_行程单_未识别出金额.pdf"
 
     def test_kind_label(self):
         name = build_filename("酒店发票", "酒店.pdf", "2026-08-11")
-        assert name == "8.11号_酒店发票_0.00.pdf"
+        assert name == "8.11号_酒店发票_未识别出金额.pdf"
 
     def test_railway(self):
         # 高铁发票用乘车日期 date（消费日期）命名，优先于开票日期 issue_date
@@ -75,7 +75,7 @@ class TestBuildFilename:
 
     def test_railway_no_rw(self):
         name = build_filename("高铁发票", "高铁.pdf", "2026-08-11")
-        assert name == "8.11号_高铁发票_0.00.pdf"
+        assert name == "8.11号_高铁发票_未识别出金额.pdf"
 
     def test_msg_amount_text(self):
         # 纯文本 msg（API 路径）：价税合计金额为33.00 → 应提取价格
@@ -87,7 +87,7 @@ class TestBuildFilename:
         # 从文件名提取金额（含去重后缀 _1）
         assert extract_amount_from_text("6.15号_打车发票_19.96.pdf") == 19.96
         assert extract_amount_from_text("6.15号_行程单_19.96_1.pdf") == 19.96
-        assert extract_amount_from_text("8.13号_行程单_0.00.pdf") == 0.0
+        assert extract_amount_from_text("8.13号_行程单_未识别出金额.pdf") == 0.0
 
     def test_invoice_kind_attname_priority(self):
         # 附件名优先：正文含"行程单"说明词，但发票附件应识别为"打车发票"

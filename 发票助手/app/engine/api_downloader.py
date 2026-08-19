@@ -86,16 +86,18 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None, amt=None):
     """简化命名：8.6号_发票_31.27.pdf / 8.6号_行程单_31.27.pdf / 8.6号_高速发票_21.00.pdf /
     8.6号_打车发票_82.94.pdf；高铁：8月9_高铁_上海虹桥-杭州东_120.00.pdf
 
-    规则：所有文件命名必须标注价格；提取不到金额时标注 0.00。
+    规则：所有文件命名必须标注价格；提取不到金额时标注「未识别出金额」。
     amt: PDF 票面金额（float），最准，优先于附件名/正文金额。
     """
     company, amount = parse_original_name(display_name)
+    no_amount_label = "未识别出金额"
     if "高铁" in kind:
         if rw:
             date_part = _month_date_label(rw.get("date") or rw.get("issue_date") or date_str)
             route = rw.get("route", "")
-            amt_v = rw.get("amount") or 0.0
-            parts = [p for p in [date_part, "高铁", route, f"{amt_v:.2f}"] if p]
+            amt_v = rw.get("amount")
+            amt_label = f"{amt_v:.2f}" if amt_v else no_amount_label
+            parts = [p for p in [date_part, "高铁", route, amt_label] if p]
             if parts:
                 return "_".join(parts) + ".pdf"
         label = "高铁发票"
@@ -115,8 +117,8 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None, amt=None):
         except Exception:
             pass
     parts = [date_label(date_str), label]
-    # 强制标注价格：提取不到则 0.00
-    parts.append(amount if amount else "0.00")
+    # 强制标注价格：提取不到则标注「未识别出金额」
+    parts.append(amount if amount else no_amount_label)
     return "_".join(p for p in parts if p) + ".pdf"
 
 
@@ -572,6 +574,11 @@ class ApiDownloadController:
             sub.append(" / ".join(
                 f"{k} {v} 张" for k, v in
                 sorted(self._kind_counts.items(), key=lambda x: -x[1])))
+        # 未识别出金额的文件数（文件名统一标注「未识别出金额」）
+        unparsed = sum(1 for f in self.downloaded_files
+                       if "未识别出金额" in os.path.basename(f))
+        if unparsed:
+            sub.append(f"未识别出金额 {unparsed} 个")
         if self._pending_count:
             sub.append(f"待确认日期 {self._pending_count} 个")
         if sub:

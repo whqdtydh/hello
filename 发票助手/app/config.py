@@ -32,6 +32,12 @@ DEFAULT_MAIL_URL = "https://wx.mail.qq.com/home/index#/list/2000"
 # 默认保存目录：桌面\车辆报销
 DEFAULT_SAVE_DIR = os.path.join(os.path.expanduser("~"), "Desktop", "车辆报销")
 
+# ---------- 版本与自动更新 ----------
+APP_NAME = "发票助手"
+APP_VERSION = "1.1.0"                      # 打包/更新比较用（语义化版本）
+GITHUB_REPO = "whqdtydh/hello"             # GitHub Releases 仓库（owner/repo）
+UPDATE_ASSET_PREFIX = "发票助手"            # 发布资产名前缀（zip）
+
 # ---------- CSS 选择器（QQ 邮箱网页版，2026-08 验证可用） ----------
 MAIL_ITEM = "div[class*=list-item]"                 # 邮件列表项
 ATTACH_LIST = "div.mail-detail-attaches"            # 附件列表容器

@@ -248,9 +248,45 @@ class MainWindow(QWidget):
         self.progress_signal.connect(self._progress_slot)
         self.done_signal.connect(self._done_slot)
         self.error_signal.connect(self._error_slot)
+        # 自动更新：启动后台检查，发现新版在结果树提示；点击该条自动下载安装
+        self.result_tree.itemClicked.connect(self._on_tree_click)
+        from app.engine import updater
+        updater.check_update_async(on_found=self._on_update_found)
         QTimer.singleShot(100, self._setup_win32)
         QTimer.singleShot(2000, self._apply_blur)
         QTimer.singleShot(3000, self.on_load_mail)
+
+    def _on_update_found(self, tag, url):
+        """发现新版本：结果树顶部提示（点击自动更新）。"""
+        self._update_url = url
+        self._log(f"[更新] 发现新版本 {tag}，点击此条自动更新", "__update")
+
+    def _on_tree_click(self, item, col):
+        """结果树点击：更新提示条 → 确认后后台下载安装并重启。"""
+        try:
+            if item.data(0, Qt.UserRole) == "update" and getattr(self, "_update_url", None):
+                if QMessageBox.question(self, "自动更新",
+                                        "将下载并安装新版本，完成后自动重启应用，继续？") \
+                        != QMessageBox.Yes:
+                    return
+                self._log("  开始下载更新…", "__update")
+                self._log("  下载与安装期间请勿关闭窗口", "__update")
+                threading.Thread(target=self._do_update, daemon=True).start()
+        except Exception:
+            pass
+
+    def _do_update(self):
+        """后台执行：下载 → 安装 → 重启。日志经 log_signal 回到结果树。"""
+        from app.engine import updater
+        url = self._update_url
+        dest = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "update_tmp")
+        zip_path = updater.download_update(url, dest)
+        if not zip_path:
+            self.log_signal.emit("  更新下载失败（网络或超时），请稍后重试", "__update")
+            return
+        ok = updater.install_update(zip_path, log=lambda m: self.log_signal.emit(m, "__update"))
+        if not ok:
+            self.log_signal.emit("  更新安装失败，已保持当前版本", "__update")
 
     def _load_wallpaper(self):
         # PyInstaller 打包后资源在 sys._MEIPASS；开发模式在项目根目录
@@ -686,6 +722,11 @@ class MainWindow(QWidget):
                     idx += 1
                 self.result_tree.insertTopLevelItem(idx, top)
                 top.setData(0, Qt.UserRole, "summary")
+            elif group == "__update":
+                # 更新提示条：置顶显示，点击触发自动更新
+                self.result_tree.insertTopLevelItem(0, top)
+                top.setData(0, Qt.UserRole, "update")
+                top.setForeground(0, QBrush(QColor("#B45309")))
             else:
                 self.result_tree.addTopLevelItem(top)
             return

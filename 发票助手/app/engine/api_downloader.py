@@ -82,19 +82,20 @@ def _month_date_label(date_str):
         return ""
 
 
-def build_filename(kind, display_name, date_str, msg=None, rw=None):
+def build_filename(kind, display_name, date_str, msg=None, rw=None, amt=None):
     """简化命名：8.6号_发票_31.27.pdf / 8.6号_行程单_31.27.pdf / 8.6号_高速发票_21.00.pdf /
     8.6号_打车发票_82.94.pdf；高铁：8月9_高铁_上海虹桥-杭州东_120.00.pdf
 
     规则：所有文件命名必须标注价格；提取不到金额时标注 0.00。
+    amt: PDF 票面金额（float），最准，优先于附件名/正文金额。
     """
     company, amount = parse_original_name(display_name)
     if "高铁" in kind:
         if rw:
             date_part = _month_date_label(rw.get("date") or rw.get("issue_date") or date_str)
             route = rw.get("route", "")
-            amt = rw.get("amount") or 0.0
-            parts = [p for p in [date_part, "高铁", route, f"{amt:.2f}"] if p]
+            amt_v = rw.get("amount") or 0.0
+            parts = [p for p in [date_part, "高铁", route, f"{amt_v:.2f}"] if p]
             if parts:
                 return "_".join(parts) + ".pdf"
         label = "高铁发票"
@@ -104,11 +105,13 @@ def build_filename(kind, display_name, date_str, msg=None, rw=None):
         label = kind
     else:
         label = kind
-    if not amount and msg is not None:
+    if amt is not None and amt > 0:
+        amount = f"{amt:.2f}"  # 票面金额优先（价税合计，最准）
+    elif not amount and msg is not None:
         try:
-            amt = ticket_amount(msg)
-            if amt:
-                amount = f"{amt:.2f}"
+            amt2 = ticket_amount(msg)
+            if amt2:
+                amount = f"{amt2:.2f}"
         except Exception:
             pass
     parts = [date_label(date_str), label]
@@ -989,7 +992,10 @@ class ApiDownloadController:
                 self.log(f"  跳过不存在: {tmp_path}")
                 continue
             kind = pdf_kinds.get(tmp_path, kind)  # 票面识别结果优先
-            fname = build_filename(kind, orig_name, shared_date, msg=text, rw=rail_infos.get(tmp_path))
+            # 票面金额优先用于命名（价税合计/行程单总计，比正文/附件名准）
+            pdf_amt = self._amount_from_pdf(tmp_path)
+            fname = build_filename(kind, orig_name, shared_date, msg=text,
+                                   rw=rail_infos.get(tmp_path), amt=pdf_amt)
             dest = unique_path(self.save_dir, fname)
             self.log(f"  移动 {os.path.basename(tmp_path)} → {os.path.basename(dest)}")
             try:
@@ -999,8 +1005,8 @@ class ApiDownloadController:
                 dest = tmp_path
             grant_current_user_access(dest)
             self.report_downloaded(dest)
-            # 金额优先取 PDF 票面（价税合计等固定字段，最准），失败用文件名兜底
-            amt = self._amount_from_pdf(dest)
+            # 金额统计：复用已提取的票面金额，失败用文件名兜底
+            amt = pdf_amt
             if amt <= 0:
                 amt = extract_amount_from_text(os.path.basename(dest))
             if amt > 0:
@@ -1036,7 +1042,7 @@ class ApiDownloadController:
         规则（按优先级）：
         1. 价税合计 后的金额（跳过「（大写）…」段）
         2. （小写）/小写 后的 ¥ 金额（增值税电子发票固定格式）
-        3. 合计/金额合计 后的金额
+        3. 总计/合计/金额合计 后的金额（货拉拉/滴滴行程单：总计178.79元）
         4. 票价 后的金额（高铁/铁路/行程单）
         5. 兜底：票面所有 ¥/￥ 符号后的金额取最大值（价税合计通常是票面最大数字）
         返回 float；提不到返回 0.0。
@@ -1050,7 +1056,9 @@ class ApiDownloadController:
         # 2) （小写）后的金额
         if not m:
             m = re.search(r"（?小写）?[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-        # 3) 合计/金额合计
+        # 3) 总计（货拉拉/滴滴行程单：总计178.79元）/ 合计 / 金额合计
+        if not m:
+            m = re.search(r"总计[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
         if not m:
             m = re.search(r"(?:金额)?合计[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
         # 4) 票价（铁路/行程单）

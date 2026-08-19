@@ -231,30 +231,32 @@ def consume_date(text):
     出行/通行类票据常标注业务发生日期，与开票（发送）日期不同日，
     例如高德行程单「行程时间：2026-07-30」，高速发票「通行时间：2026-08-13」。
     支持标签：行程时间 / 通行时间 / 出行日期 / 乘车日期 / 消费日期 / 交易时间。
+    规则配置化（config/extract_rules.json）：标签列表 / 区间 / 兜底顺序。
     """
     if not text:
         return ""
+    from app.engine.extract_rules import load_rules
+    cfg = load_rules()
     # 优先带标签的消费日期
-    m = re.search(
-        r"(?:行程时间|通行时间|出行日期|乘车日期|消费日期|交易时间|行程日期|上车时间)"
-        r"[：:\s]*((?:20\d{2})[年\-/.]\d{1,2}[月\-/.]\d{1,2})",
-        text)
-    if m:
-        d = _norm_date(m.group(1))
-        if d:
-            return d
+    labels = "|".join(re.escape(x) for x in cfg.get("date_labels", []))
+    if labels:
+        m = re.search(
+            rf"(?:{labels})[：:\s]*((?:20\d{{2}})[年\-/.]\d{{1,2}}[月\-/.]\d{{1,2}})",
+            text)
+        if m:
+            d = _norm_date(m.group(1))
+            if d:
+                return d
     # 行程区间：货拉拉/滴滴行程单「2026-07-28 至 2026-07-28」，取起始日=用车当天
     # （须在兜底之前，否则会先命中「申请日期：2026-08-18」这类开票日）
-    m = re.search(
-        r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})\s*至\s*20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}",
-        text)
+    m = re.search(cfg.get("date_range_pattern", ""), text)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     # 兜底：文本中任意「20xx年M月D日」形式的日期（开票日期优先排除？无标签则返回第一个）
-    m = re.search(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", text)
+    m = re.search(cfg.get("date_cn_pattern", r"(20\d{2})年(\d{1,2})月(\d{1,2})日"), text)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    m = re.search(r"(20\d{2})[./\-](\d{1,2})[./\-](\d{1,2})", text)
+    m = re.search(cfg.get("date_plain_pattern", r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})"), text)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
     return ""

@@ -6,13 +6,18 @@
 
 import os
 import re
+import threading
 
 from app.engine.archive_service import _cn_date_to_iso
 from app.engine.mail_parse import consume_date
 
+# OCR 引擎懒加载（首次使用才加载，约 3-4 秒；加载后复用）
+_ocr_engine = None
+_ocr_lock = threading.Lock()
 
-def pdf_text(filepath):
-    """读取 PDF 全文文本，失败返回空串。"""
+
+def _pymupdf_text(filepath):
+    """读取 PDF 文本层全文文本，失败返回空串。"""
     try:
         import pymupdf  # PyMuPDF
         doc = pymupdf.open(filepath)
@@ -24,45 +29,77 @@ def pdf_text(filepath):
         return ""
 
 
-def amount_from_pdf(filepath):
-    """从 PDF 票面提取金额（普通发票「价税合计」是标准固定字段，最准）。
+def _get_ocr_engine():
+    """懒加载 RapidOCR 引擎（线程安全，失败返回 None）。"""
+    global _ocr_engine
+    if _ocr_engine is None:
+        with _ocr_lock:
+            if _ocr_engine is None:
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+                    _ocr_engine = RapidOCR()
+                except Exception:
+                    _ocr_engine = False  # 加载失败，不再重试
+    return _ocr_engine or None
 
-    规则（按优先级）：
-    1. 价税合计 后的金额（跳过「（大写）…」段）
-    2. （小写）/小写 后的 ¥ 金额（增值税电子发票固定格式）
-    3. 总计/合计/金额合计 后的金额（货拉拉/滴滴行程单：总计178.79元）
-    4. 票价 后的金额（高铁/铁路/行程单）
-    5. 兜底：票面所有 ¥/￥ 符号后的金额取最大值（价税合计通常是票面最大数字）
+
+def ocr_text(filepath, dpi=200, max_pages=1):
+    """图片型/扫描件 PDF 降级 OCR：渲染前 N 页为图片识别，拼接文本。
+
+    仅文本层为空或过少时调用（见 pdf_text）。失败返回空串（静默降级）。
+    """
+    try:
+        engine = _get_ocr_engine()
+        if engine is None:
+            return ""
+        import pymupdf
+        doc = pymupdf.open(filepath)
+        parts = []
+        try:
+            for i, page in enumerate(doc):
+                if i >= max_pages:
+                    break
+                pix = page.get_pixmap(dpi=dpi)
+                import numpy as np
+                img = np.frombuffer(pix.samples, dtype=np.uint8)
+                img = img.reshape(pix.height, pix.width, pix.n)
+                if pix.n == 4:  # RGBA → RGB（OCR 不需要 alpha）
+                    img = img[:, :, :3]
+                res, _ = engine(img)
+                if res:
+                    parts.append("".join(r[1] for r in res))
+        finally:
+            doc.close()
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def pdf_text(filepath, ocr_fallback=True):
+    """读取 PDF 全文文本；文本层为空或过少（图片型/扫描件）时降级 OCR。
+
+    OCR 结果文本优于文本层时才采用，避免噪声文本覆盖有效内容。
+    """
+    txt = _pymupdf_text(filepath)
+    if ocr_fallback and len(txt.strip()) < 30:
+        ocr = ocr_text(filepath)
+        if len(ocr.strip()) > len(txt.strip()):
+            return ocr
+    return txt
+
+
+def amount_from_pdf(filepath):
+    """从 PDF 票面提取金额（规则配置化，见 config/extract_rules.json 与
+    app.engine.extract_rules.extract_amount）。
+
+    优先级：价税合计 → 小写 → 总计（行程单）→ 合计 → 票价 → ¥最大值兜底。
     返回 float；提不到返回 0.0。
     """
+    from app.engine.extract_rules import extract_amount
     txt = pdf_text(filepath)
     if not txt:
         return 0.0
-    m = None
-    # 1) 价税合计 → 其后最近的数字（非贪婪跳过「（大写）壹佰贰拾叁元…」段）
-    m = re.search(r"价税合计[^0-9]{0,60}?[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt, re.S)
-    # 2) （小写）后的金额
-    if not m:
-        m = re.search(r"（?小写）?[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-    # 3) 总计（货拉拉/滴滴行程单：总计178.79元）/ 合计 / 金额合计
-    if not m:
-        m = re.search(r"总计[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-    if not m:
-        m = re.search(r"(?:金额)?合计[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-    # 4) 票价（铁路/行程单）
-    if not m:
-        m = re.search(r"票价[¥￥]?\s*(\d+(?:\.\d{1,2})?)", txt)
-    if m:
-        amt = float(m.group(1))
-        if 0 < amt < 1000000:
-            return amt
-    # 5) 兜底：所有 ¥/￥ 金额取最大值（价税合计通常是票面最大数字）
-    amounts = [float(x) for x in re.findall(r"[¥￥]\s*(\d+(?:\.\d{1,2})?)", txt)]
-    if amounts:
-        amt = max(amounts)
-        if 0 < amt < 1000000:
-            return amt
-    return 0.0
+    return extract_amount(txt)
 
 
 def consume_date_from_pdf(data):

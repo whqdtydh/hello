@@ -280,7 +280,7 @@ class TestInvoiceKindNaming:
         # 高铁 → 高铁发票
         kind = "高铁发票"
         name = build_filename(kind, "高铁.pdf", "2026-08-13")
-        assert name == "8.13号_高铁发票_0.00.pdf"
+        assert name == "8.13号_高铁发票_未识别出金额.pdf"
 
     def test_invoice_kind_dispatch(self):
         # 综合判断：附件名含「曹操出行」→ 打车发票

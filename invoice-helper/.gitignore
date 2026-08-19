@@ -1,0 +1,22 @@
+# Python 字节码缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 构建产物（PyInstaller）
+build/
+dist/
+
+# 日志文件
+*.log
+crash_diag.log
+
+# WebView2 第三方 SDK（45MB，可从 NuGet 重新获取，不进仓库）
+webview2sdk/
+
+# 测试缓存
+.pytest_cache/
+
+# 编辑器
+.idea/
+.vscode/

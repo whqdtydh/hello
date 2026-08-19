@@ -32,7 +32,7 @@ from app.engine.archive_service import (
 from app.engine.mail_parse import invoice_kind, consume_date, kind_from_pdf
 from app.engine import pdf_service
 from app.engine.task_store import TaskStore
-from app.engine.web_client import WebClient
+from app.engine.web_client_wv2 import WebClient
 
 
 # ---------- 链接提取 ----------
@@ -422,8 +422,8 @@ class ApiDownloadController:
         if not failed:
             return []
         self.log(f"检测到 {len(failed)} 个接口可能已变更: {', '.join(failed)}，尝试从网页观察记录学习…")
-        # QtWebEngine 只能在 GUI 线程执行 JS：后台线程调用必须走线程安全包装
-        observations = self.client.run_js_obj_threadsafe(self.client.get_observed_requests_script())
+        # 观察记录：WebView2 版由 CDP Network 事件收集（线程安全，直接读取）
+        observations = self.client.get_observed_requests()
         if not observations:
             self.log("  暂无网页请求记录。请在左侧网页中手动操作一次"
                      "（打开收件箱 / 打开一封邮件 / 下载一次发票），再点击开始下载。")

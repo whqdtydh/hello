@@ -1,12 +1,5 @@
 import sys, os, traceback, threading, time, faulthandler
 
-# ------------------- QtWebEngine 环境配置 -------------------
-# 禁用 GPU 加速以避免 Cache/显卡 权限导致的崩溃
-os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --disable-software-rasterizer --disable-features=VizDisplayCompositor"
-os.environ["QT_QUICK_BACKEND"] = "software"
-os.environ["QTWEBENGINE_DISABLE_GPU"] = "1"
-os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
-
 os.chdir(r"D:\AI\git\发票助手")
 
 LOG = os.path.join(os.environ["TEMP"], "invoice_crash.log")
@@ -41,26 +34,28 @@ threading.Thread.run = _thread_run
 _log("=== START ===")
 
 try:
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QWidget
     from PySide6.QtCore import QTimer
-    from PySide6.QtWebEngineCore import QWebEngineProfile
+    from PySide6.QtGui import QWindow
 
     app = QApplication(sys.argv)
 
     # App-level exception handling
     app.aboutToQuit.connect(lambda: _log("aboutToQuit"))
 
-    profile = QWebEngineProfile("invoice_profile", app)
-    profile.setPersistentCookiesPolicy(
-        QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-    profile.setCachePath(os.path.join(os.environ["TEMP"], ".invoice_cache"))
-    profile.setPersistentStoragePath(os.path.join(os.environ["TEMP"], ".invoice_data"))
+    # WebView2 控件（pythonnet 宿主）：创建 → 句柄嵌入 Qt 容器
+    from app.engine import webview2_host
+    from app import config
+    wv, hwnd, _port = webview2_host.create_view(
+        user_data_folder=config.PROFILE_DIR)
+    qwin = QWindow.fromWinId(hwnd)
+    container = QWidget.createWindowContainer(qwin)
 
     from app.engine import msgid_service
     msgid_service.start_server()
 
     from app.ui.main_window import MainWindow
-    win = MainWindow(profile=profile)
+    win = MainWindow(web_container=container, wv=wv)
     win.show()
     _log(f"SHOW OK size={win.width()}x{win.height()} alive={win.isVisible()}")
 

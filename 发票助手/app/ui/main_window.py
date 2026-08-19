@@ -15,9 +15,7 @@ import time
 import html
 
 from PySide6.QtCore import Qt, Signal, QTimer, QRect, QSize, QPoint
-from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QPixmap, QFont, QCursor, QBrush, QKeySequence
-from PySide6.QtWebEngineCore import QWebEngineProfile
-from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtGui import QColor, QPainter, QPen, QLinearGradient, QPixmap, QFont, QCursor, QBrush, QKeySequence, QWindow
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFileDialog,
@@ -28,7 +26,7 @@ from PySide6.QtWidgets import (
 
 from app import config
 from app.engine import msgid_service
-from app.engine.web_client import WebClient
+from app.engine.web_client_wv2 import WebClient
 from app.engine.api_downloader import ApiDownloadController
 from app.ui.theme import ThemeManager
 from app.ui.windows_blur import apply_window_blur
@@ -187,17 +185,17 @@ class _FloatingButtons(QWidget):
         lay.setContentsMargins(8, 4, 0, 0)
         lay.setSpacing(6)
 
-        btn_close = self._make_btn("×", "#E0443C", "#B91C1C")
-        btn_close.clicked.connect(self.close_clicked)
-        lay.addWidget(btn_close)
+        btn_min = self._make_btn("—", "#1FA830", "#15803D")
+        btn_min.clicked.connect(self.minimize_clicked)
+        lay.addWidget(btn_min)
 
         btn_max = self._make_btn("□", "#DDA020", "#B45309")
         btn_max.clicked.connect(self.maximize_clicked)
         lay.addWidget(btn_max)
 
-        btn_min = self._make_btn("—", "#1FA830", "#15803D")
-        btn_min.clicked.connect(self.minimize_clicked)
-        lay.addWidget(btn_min)
+        btn_close = self._make_btn("×", "#E0443C", "#B91C1C")
+        btn_close.clicked.connect(self.close_clicked)
+        lay.addWidget(btn_close)
 
     @staticmethod
     def _make_btn(glyph, color, hover):
@@ -224,10 +222,12 @@ class MainWindow(QWidget):
     done_signal = Signal(object)
     error_signal = Signal(str)
 
-    def __init__(self, profile=None):
+    def __init__(self, web_container=None, wv=None):
         super().__init__()
         self.engine = None
         self._running = False
+        self._web_container = web_container  # WebView2 控件容器（由 run() 创建嵌入）
+        self._wv = wv                          # WebView2 控件（原生注入用）
         self.setObjectName("Root")
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -239,7 +239,7 @@ class MainWindow(QWidget):
         self._normal_geometry = None
         self._was_maximized = False
         self._setup_shortcuts()
-        self._build_ui(profile)
+        self._build_ui()
         # 边勾边读：后台预读器（勾选时立即拉详情，下载时零等待）
         from app.engine.preloader import Preloader
         self.preloader = Preloader(self.web)
@@ -471,17 +471,17 @@ class MainWindow(QWidget):
         wc_lay = QVBoxLayout(self._web_card)
         wc_lay.setContentsMargins(0, 0, 0, 0)
         wc_lay.setSpacing(0)
-        # 左侧 = 内嵌 QQ 邮箱网页（登录 / 勾选邮件）
-        self.view = QWebEngineView(profile) if profile else QWebEngineView()
-        self.view.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.view.page().setBackgroundColor(QColor(255, 255, 255))
-        self.view.setStyleSheet("background: white; border: none;")
-        # 渲染进程崩溃监控：记录崩溃原因与退出码，便于诊断闪退
-        self.view.page().renderProcessTerminated.connect(self._on_render_crashed)
-        self.web = WebClient(self.view)
+        # 左侧 = WebView2（系统内核）内嵌 QQ 邮箱网页（登录 / 勾选邮件）
+        self.web = WebClient(wv=self._wv)
         self.web.log_signal.connect(lambda m: None)  # 网页加载日志不进结果树
-        self.web._install_tracker()
-        wc_lay.addWidget(self.view, 1)
+        if self._web_container is not None:
+            wc_lay.addWidget(self._web_container, 1)
+        else:
+            # 无容器（测试环境）：占位提示
+            placeholder = QLabel("WebView2 未初始化（开发测试模式）")
+            placeholder.setAlignment(Qt.AlignCenter)
+            placeholder.setStyleSheet("background: white; color: #9CA3AF; font-size: 14px;")
+            wc_lay.addWidget(placeholder, 1)
         cl.addWidget(self._web_card, 7)
 
         right_panel = QWidget()
@@ -517,26 +517,6 @@ class MainWindow(QWidget):
             self.showNormal()
             if self._normal_geometry is not None:
                 self.setGeometry(self._normal_geometry)
-
-    def _on_render_crashed(self, status):
-        """渲染进程崩溃回调：记录崩溃状态，便于诊断闪退。"""
-        try:
-            from PySide6.QtWebEngineCore import QWebEnginePage
-            names = {QWebEnginePage.RenderProcessCrashStatus.Crashed: "进程崩溃",
-                     QWebEnginePage.RenderProcessCrashStatus.Terminated: "被终止",
-                     QWebEnginePage.RenderProcessCrashStatus.Killed: "被杀死",
-                     QWebEnginePage.RenderProcessCrashStatus.NormalTermination: "正常退出"}
-            why = names.get(status, f"未知({status})")
-            self._log(f"💥 WebView 渲染进程异常: {why}")
-            # 同时写入独立诊断文件，防止窗口无响应时丢失
-            try:
-                import time
-                with open(r"D:\AI\git\发票助手\crash_diag.log", "a", encoding="utf-8") as f:
-                    f.write(f"[{time.strftime('%H:%M:%S')}] RENDER CRASH: {why}\n")
-            except Exception:
-                pass
-        except Exception:
-            pass
 
     def _close_app(self):
         """关闭按钮：正常关闭窗口并退出应用。"""
@@ -925,11 +905,13 @@ class _DummyProgress:
 
 def run():
     app = QApplication(sys.argv)
-    profile = QWebEngineProfile("invoice_profile", app)
-    profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
-    profile.setCachePath(config.PROFILE_CACHE_DIR)
-    profile.setPersistentStoragePath(config.PROFILE_STORAGE_DIR)
+    # WebView2 控件（pythonnet 宿主）：创建 → 句柄嵌入 Qt 容器
+    from app.engine import webview2_host
+    wv, hwnd, _port = webview2_host.create_view(
+        user_data_folder=config.PROFILE_DIR)
+    qwin = QWindow.fromWinId(hwnd)
+    container = QWidget.createWindowContainer(qwin)
     msgid_service.start_server()
-    win = MainWindow(profile=profile)
+    win = MainWindow(web_container=container, wv=wv)
     win.show()
     sys.exit(app.exec())

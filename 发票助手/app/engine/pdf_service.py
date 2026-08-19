@@ -36,7 +36,7 @@ def _get_ocr_engine():
         with _ocr_lock:
             if _ocr_engine is None:
                 try:
-                    from rapidocr_onnxruntime import RapidOCR
+                    from app.engine.ocr_light import RapidOCR
                     _ocr_engine = RapidOCR()
                 except Exception:
                     _ocr_engine = False  # 加载失败，不再重试

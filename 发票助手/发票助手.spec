@@ -130,6 +130,9 @@ def _keep_bin(entry):
     if '/translations/qtwebengine_locales/' in dest:
         base = name.lower()
         return any(k in base for k in ('zh-cn.pak', 'zh-tw.pak', 'en-us.pak'))
+    # 5) opencv 视频解码组件（OCR 用不到，纯视频后端，省约 50 MB）
+    if name.startswith('opencv_videoio_ffmpeg'):
+        return False
     return True
 a.binaries = [b for b in a.binaries if _keep_bin(b)]
 pyz = PYZ(a.pure)

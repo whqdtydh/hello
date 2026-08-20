@@ -1,0 +1,43 @@
+<!-- resources/web/download_list.html -->
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>下载列表</title>
+  <link rel="stylesheet" href="download_list.css">
+</head>
+<body>
+  <div id="download-container">
+    <!-- 顶部工具栏 -->
+    <div class="toolbar">
+      <h2>发票下载列表</h2>
+      <div class="toolbar-actions">
+        <span id="selected-count" class="badge">已选 0 封</span>
+        <button id="btn-download" class="btn-primary" disabled>开始下载</button>
+      </div>
+    </div>
+
+    <!-- 列表区域 -->
+    <div id="download-list" class="mail-list">
+      <!-- 由 JS 动态渲染 -->
+    </div>
+
+    <!-- 空状态 -->
+    <div id="empty-state" class="empty-state" style="display:none;">
+      <svg class="icon" viewBox="0 0 24 24"><path d="M20 6H4v14h16V6zm-2 12H6V8h12v10zm-4-6h-4v4h4v-4zm0 8h-4v4h4v-4z"/></svg>
+      <p>暂无勾选邮件</p>
+      <small>在左侧邮箱列表中勾选需要下载的邮件</small>
+    </div>
+
+    <!-- 底部进度条（下载时显示） -->
+    <div id="progress-bar" class="progress-bar" style="display:none;">
+      <div class="progress-track">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <span class="progress-text" id="progress-text">准备中...</span>
+    </div>
+  </div>
+
+  <script src="download_list.js"></script>
+</body>
+</html>

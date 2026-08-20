@@ -28,6 +28,7 @@ from app import config
 from app.engine import msgid_service
 from app.engine.web_client_wv2 import WebClient
 from app.engine.api_downloader import ApiDownloadController
+from app.engine.animation import Animation
 from app.ui.theme import ThemeManager
 from app.ui.windows_blur import apply_window_blur
 
@@ -740,9 +741,17 @@ class MainWindow(QWidget):
             ratio = processed / total
             self._prog_bar.setRatio(ratio)
             self._prog_pct.setText(f"{ratio * 100:.1f}%")
+            # 同步 Web 进度条动画
+            percent = int(ratio * 100)
+            js_set = Animation.progress_set('#progress-fill', percent, duration=300)
+            self.web.run_js(js_set)
+            self.web.run_js(f"window.progressSet({percent}, '{processed}/{total} {downloaded} 个 PDF');")
 
     def _error_slot(self, msg):
         self._set_status("下载失败", "error")
+        # Web 错误动画
+        self.web.run_js(Animation.progress_error('#progress-fill', duration=500))
+        self.web.run_js(f"window.progressError('失败: {msg[:80]}');")
 
     def _set_status(self, text, kind="idle"):
         colors = {"ready": "#059669", "busy": "#1E3A5F", "error": "#DC2626", "idle": "#6B7280"}
@@ -761,6 +770,13 @@ class MainWindow(QWidget):
             self.dir_edit.setText(ctrl.save_dir)
         self._prog_bar.setRatio(0.0)
         self._prog_pct.setText("0%")
+        # Web 完成动画
+        js_complete = Animation.progress_complete(
+            '#progress-fill',
+            duration=500,
+            on_complete="window.progressHide(); window.progressSet(100, '全部完成');"
+        )
+        self.web.run_js(js_complete)
         if files:
             self._set_status(f"完成 · {len(files)} 个 PDF", "ready")
         else:
@@ -863,11 +879,40 @@ class MainWindow(QWidget):
 
     def _run_api_download(self, dest, mails, sid):
         try:
+            # 1. 下载开始：显示 Web 进度条 + 启动动画
+            self.web.run_js("window.progressStart();")
+            self.web.run_js(Animation.progress_start('#progress-fill', duration=600))
+
             ctrl = ApiDownloadController(self.web, dest, on_log=self.log_signal.emit,
                                          on_progress=self.progress_signal.emit,
                                          preloader=self.preloader)
             self.api_ctrl = ctrl
+
+            # 包装进度回调：同时更新原生进度条 + Web 进度条动画
+            def _on_progress(current, total, downloaded):
+                # 原生进度条
+                self.progress_signal.emit(current, total, downloaded)
+                # Web 进度条动画
+                if total > 0:
+                    percent = int(current / total * 100)
+                    js_set = Animation.progress_set('#progress-fill', percent, duration=400)
+                    self.web.run_js(js_set)
+                    self.web.run_js(f"window.progressSet({percent}, '{current}/{total} {downloaded} 个 PDF');")
+                else:
+                    # 不确定总数：不确定进度动画
+                    self.web.run_js("window.progressIndeterminate('正在获取列表...');")
+
+            ctrl.set_progress_callback(_on_progress)
             files = ctrl.run(mails, sid=sid)
+
+            # 全部完成：进度条滑到 100% + 完成动画
+            js_complete = Animation.progress_complete(
+                '#progress-fill',
+                duration=500,
+                on_complete="window.progressHide(); window.progressSet(100, '全部完成');"
+            )
+            self.web.run_js(js_complete)
+
             try:
                 import datetime as _dt
                 with open(r"D:\AI\git\invoice-helper\crash_diag.log", "a", encoding="utf-8") as _f:
@@ -876,6 +921,9 @@ class MainWindow(QWidget):
                 pass
             self.done_signal.emit(files)
         except Exception as e:
+            # 出错：红色抖动 + 错误文案
+            self.web.run_js(Animation.progress_error('#progress-fill', duration=500))
+            self.web.run_js(f"window.progressError('失败: {str(e)[:80]}');")
             self.log_signal.emit("失败 " + str(e), "")
             self.done_signal.emit([])
             self.error_signal.emit(str(e))

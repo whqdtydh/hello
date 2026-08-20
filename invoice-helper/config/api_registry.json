@@ -26,7 +26,7 @@
       "params": [
         "mailid"
       ],
-      "status": "failed"
+      "status": "ok"
     },
     "fapiao": {
       "path": "/fapiao/download",

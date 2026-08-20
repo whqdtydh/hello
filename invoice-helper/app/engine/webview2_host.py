@@ -122,19 +122,29 @@ def _wait_cdp_ready(port, timeout=20):
     return False
 
 
-def add_script_on_document_created(wv, source):
+def add_script_on_document_created(wv, source, timeout=3):
     """WebView2 原生注入：所有文档加载前执行（CDP 的 addScript 在 WebView2 不生效）。
 
     必须在 CoreWebView2 就绪后调用；返回注入标识（失败返回 None）。
+    注意：GetAwaiter().GetResult() 在 .NET 任务未完成时无超时死等，
+    内核半就绪状态下会永久阻塞主线程（历史 bug：启动卡死）。
+    故放到后台线程执行，主线程最多等待 timeout 秒。
     """
-    try:
-        core = wv.CoreWebView2
-        if core is None:
-            return None
-        task = core.AddScriptToExecuteOnDocumentCreatedAsync(source)
-        return task.GetAwaiter().GetResult()
-    except Exception:
-        return None
+    import threading
+    result = [None]
+    def _run():
+        try:
+            core = wv.CoreWebView2
+            if core is None:
+                return
+            task = core.AddScriptToExecuteOnDocumentCreatedAsync(source)
+            result[0] = task.GetAwaiter().GetResult()
+        except Exception:
+            pass
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    return result[0]
 
 
 def navigate(wv, url):

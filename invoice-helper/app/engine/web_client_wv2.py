@@ -27,8 +27,11 @@ TRACKER_SCRIPT = r'''
   var MIDMAP='invoice_msgid_map';
   var SESSION_KEY='invoice_session_start';
   try{
-    localStorage.removeItem(KEY);
-    localStorage.setItem(SESSION_KEY, String(Date.now()));
+    // 注意：不再清空勾选记录、不重置会话起点。
+    // 页面重载/重复注入会触发本脚本，若清空 KEY/重置 SESSION，
+    // 勾选过程中任何一次导航都会把已记录的勾选全部丢弃（历史 bug：1000 封只读到 14 封）。
+    // 会话起点仅在缺失时设置；会话推进由读取端 SELECTED_MAILS_JS 在消费后负责前移。
+    if(!localStorage.getItem(SESSION_KEY)) localStorage.setItem(SESSION_KEY, String(Date.now()));
   }catch(e){}
   function senderOf(item){
     var s=item.querySelector('.mail-sender,.mail-name,[class*=sender]');
@@ -115,7 +118,7 @@ TRACKER_SCRIPT = r'''
     if(cb&&cb.checked)return true;
     return false;
   }
-  function syncItem(item){
+  function syncItem(item, skipMid){
     var mailid=item.getAttribute('data-mailid')||'';
     if(!mailid)return;
     var all=readAll();
@@ -136,7 +139,7 @@ TRACKER_SCRIPT = r'''
           for(var _i=0;_i<_a.length;_i++){var _v=item.getAttribute(_a[_i]);if(_v&&/xmmx/.test(_v)){_dm=_v;break;}}
           if(!_dm){var _s=item.querySelector('[data-messageid],[data-mid],[data-msgid],[data-message-id]'); if(_s){_dm=_s.getAttribute('data-messageid')||_s.getAttribute('data-mid')||'';}}
           if(_dm){saveMid(mailid,_dm);}
-          else if(!midMap()[mailid]){grabMsgID(mailid);}
+          else if(!skipMid && !midMap()[mailid]){grabMsgID(mailid);}
         }catch(e){}
       }
     }else{
@@ -146,6 +149,11 @@ TRACKER_SCRIPT = r'''
       }
     }
   }
+  // 全量同步当前 DOM 可见行（定时轮询/整页全选用；skipMid 避免高频重复抓 message-id）
+  function syncAllVisible(){
+    var rows=document.querySelectorAll('div[class*=list-item]');
+    for(var i=0;i<rows.length;i++){ syncItem(rows[i], true); }
+  }
   document.addEventListener('click', function(e){
     var t=e.target;
     var item=t.closest?t.closest('div[class*=list-item]'):null;
@@ -154,7 +162,16 @@ TRACKER_SCRIPT = r'''
     if(!mailid)return;
     setTimeout(function(){ syncItem(item); }, 100);
   }, true);
-})();
+  document.addEventListener('change', function(e){
+    var t=e.target;
+    var item=t.closest?t.closest('div[class*=list-item]'):null;
+    if(!item){ syncAllVisible(); return; }   // 表头全选等批量控件：整页刷新补录
+    var mailid=item.getAttribute('data-mailid')||'';
+    if(!mailid)return;
+    setTimeout(function(){ syncItem(item, true); }, 100);
+  }, true);
+  setInterval(syncAllVisible, 400);
+})()
 '''
 
 SELECTED_MAILS_JS = r"""
@@ -222,10 +239,6 @@ SELECTED_MAILS_JS = r"""
   var stored=readAll();
   var sessStart=0;
   try{sessStart=parseInt(localStorage.getItem('invoice_session_start')||'0',10)||0;}catch(e){}
-  var domMailids={};
-  for(var di=0;di<checkedEls.length;di++){
-    domMailids[checkedEls[di].getAttribute('data-mailid')||'']=true;
-  }
   var domAll={};
   for(var ai=0;ai<items.length;ai++){
     var _mid=items[ai].getAttribute('data-mailid')||'';
@@ -235,9 +248,8 @@ SELECTED_MAILS_JS = r"""
     var d=stored[k];
     if(!d||!d.mailid)continue;
     if(!d.ts||!sessStart||d.ts<sessStart)continue;
-    if(domAll[d.mailid]){
-      if(!domMailids[d.mailid])continue;
-    }
+    // 不再用 domAll 二次裁决：取消勾选由 tracker 的 else 分支实时清理，
+    // 此处一律合并本地记录，避免虚拟滚动下"当前页未勾选"误杀大量记录
     if(!d.message_id&&mids[d.mailid])d.message_id=mids[d.mailid];
     merged[k]=d;
   }
@@ -302,7 +314,7 @@ class _CDP:
             time.sleep(0.5)
         if not ws_url:
             raise RuntimeError("CDP 端口 %d 未就绪（WebView2 未初始化）" % port)
-        self._ws = websocket.create_connection(ws_url, timeout=120,
+        self._ws = websocket.create_connection(ws_url, timeout=10,
                                                suppress_origin=True)
         # 恢复注入脚本（重连后旧注册丢失，须重放）
         for src in self._page_script_sources:
@@ -336,8 +348,17 @@ class _CDP:
                     req_id = self._id
                     self._ws.send(json.dumps({"id": req_id, "method": method,
                                               "params": params or {}}))
+                    # 响应等待带超时：导航/页面切换窗口期 CDP 响应可能丢失，
+                    # 若无超时 recv() 会无限阻塞导致 Qt 主线程卡死（历史 bug）
+                    deadline = time.time() + 5.0
+                    self._ws.settimeout(0.5)
                     while True:
-                        msg = json.loads(self._ws.recv())
+                        try:
+                            msg = json.loads(self._ws.recv())
+                        except websocket.WebSocketTimeoutException:
+                            if time.time() > deadline:
+                                raise TimeoutError("CDP 响应超时: %s" % method)
+                            continue
                         if msg.get("id") == req_id:
                             return msg.get("result", {})
                         if msg.get("method") == "Network.requestWillBeSent" and self._observing:
@@ -349,8 +370,8 @@ class _CDP:
                                     "t": int(time.time() * 1000)})
                                 if len(self._net_events) > 500:
                                     self._net_events = self._net_events[-500:]
-            except (websocket.WebSocketException, OSError, KeyError, ValueError):
-                # 连接被外部调试器踢断 / 网络异常 → 重连后重试一次
+            except (websocket.WebSocketException, OSError, KeyError, ValueError, TimeoutError):
+                # 连接被外部调试器踢断 / 响应超时 / 网络异常 → 重连后重试一次
                 self._reconnect()
                 continue
         raise RuntimeError("CDP 调用失败（已重连仍失败）: %s" % method)
@@ -429,6 +450,7 @@ class WebClient(QObject):
         self._tracker_installed = False
         self._page_script_ids = []
         self._install_tracker()
+        self.start_state_sampler()
 
     # ---------- JS 执行（CDP 本身线程安全，无需信号槽转发） ----------
     def run_js(self, script, timeout=20000):
@@ -477,8 +499,15 @@ class WebClient(QObject):
         if self._wv is not None:
             from app.engine.webview2_host import navigate as native_nav
             native_nav(self._wv, url)
-            return
-        self._cdp.navigate(url)
+        else:
+            self._cdp.navigate(url)
+        # 导航后补注入 tracker：AddScript 注册失败时保证当前页可用（幂等，
+        # 文档创建时已注入过则 IIFE 直接 return）
+        try:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(4000, self._inject_tracker_now)
+        except Exception:
+            pass
 
     def current_url(self):
         try:
@@ -511,30 +540,66 @@ class WebClient(QObject):
 
     # ---------- 勾选监听注入（CDP 版：新文档加载前注入 + 当前页补注入） ----------
     def _install_tracker(self):
+        import threading as _th
         src = TRACKER_SCRIPT.replace("__PRELOAD_PORT__", str(msgid_service.PORT))
+        # 应用启动清理：清空上次会话残留勾选记录 + 重置会话起点。
+        # 注意：tracker 注入脚本本身不再清空（避免页面重载时误清历史 bug），
+        # 因此"清空"只能放在这里——每次应用启动仅执行一次。
+        # 异步执行：CDP 未就绪时 run_js 可能阻塞数秒，不能卡主线程。
+        _th.Thread(target=self._startup_cleanup, daemon=True).start()
         native_ok = False
         # 首选：WebView2 原生注入（所有文档加载前执行，可靠）
+        # 注意：必须检查返回值——WebView2 内核未就绪时 AddScriptToExecuteOnDocumentCreatedAsync
+        # 返回 None（失败），若忽略会导致 tracker 从未注入（历史 bug：installed=false）
         if self._wv is not None:
             from app.engine.webview2_host import add_script_on_document_created
             try:
-                add_script_on_document_created(self._wv, src)
-                native_ok = True
-            except Exception:
-                pass
+                sid = add_script_on_document_created(self._wv, src)
+                if sid is not None:
+                    native_ok = True
+                    self._diag_log(f"TRACKER native inject OK sid={str(sid)[:20]}")
+                else:
+                    self._diag_log("TRACKER native inject FAILED (core not ready)")
+            except Exception as e:
+                self._diag_log(f"TRACKER native inject EXC: {e}")
         if not native_ok:
-            # 兜底：CDP addScript（部分环境有效）+ 当前页面手动注入
+            # 兜底：CDP addScript（对未来的文档尽力而为）+ 采样器自愈注入。
+            # 注意：绝不能在后台线程重试访问 wv（WinForms 控件跨线程操作会导致
+            # .NET 崩溃、进程无声退出——历史崩溃根因），原生注入失败就放弃，
+            # 由采样器每 2 秒检查 installed 并在缺失时通过 CDP run_js 补注入。
             if src not in self._cdp._page_script_sources:
                 self._cdp._page_script_sources.append(src)
             try:
                 self._cdp.call("Page.addScriptToEvaluateOnNewDocument", {"source": src})
             except Exception:
                 pass
-        # 当前已加载页面补一次注入
+        # 当前已加载页面补一次注入（幂等：IIFE 开头有 __invoiceTrackerInstalled 防重）
+        self._inject_tracker_now()
+        self._tracker_installed = True
+
+    def _startup_cleanup(self):
         try:
-            self.run_js(src + ";(function(){try{window.__invoiceTrackerInstalled=false;}catch(e){}})();" + src)
+            self.run_js("(function(){try{localStorage.removeItem('invoice_selected');"
+                        "localStorage.setItem('invoice_session_start', String(Date.now()));"
+                        "}catch(e){}})()", timeout=5000)
         except Exception:
             pass
-        self._tracker_installed = True
+
+    def _inject_tracker_now(self):
+        """向当前文档手动注入 tracker（导航完成后调用，幂等）。后台线程执行，避免阻塞 UI。"""
+        import threading as _th
+
+        def _run():
+            try:
+                src = TRACKER_SCRIPT.replace("__PRELOAD_PORT__", str(msgid_service.PORT))
+                val = self.run_js(src, timeout=5000)
+                self._diag_log(f"INJECT done ret={str(val)[:60]}")
+            except Exception as e:
+                self._diag_log(f"INJECT err: {e}")
+        _th.Thread(target=_run, daemon=True).start()
+
+    # 注意：原生注入重试逻辑已移除——后台线程访问 WinForms 控件(wv)会触发
+    # .NET 跨线程崩溃（进程无声退出）；原生注入失败时由采样器自愈（CDP run_js）兜底。
 
     # ---------- 接口观察（CDP Network 事件替代 JS hook） ----------
     def start_api_observe(self):
@@ -548,14 +613,73 @@ class WebClient(QObject):
         """返回观察到的请求列表：[{u, m, t}]（与旧版语义一致）。"""
         return list(self._cdp._net_events)
 
+    # ---------- 诊断状态采样（应用自身 CDP 连接定时读取页面/勾选状态，写入 msgid_service 供外部 HTTP 查询） ----------
+    def start_state_sampler(self, interval_ms=2000):
+        """每 interval_ms 采样一次页面勾选状态，写入 msgid_service.DIAG_STATE。
+        外部通过 http://127.0.0.1:18765/diag 查询，避免外部另开 CDP 连接干扰运行。
+        注意：采样/注入在后台线程执行——CDP 不畅时单次可阻塞数秒，
+        放主线程会卡死 Qt 事件循环（历史 bug：启动后无响应）。"""
+        import threading as _th
+        from PySide6.QtCore import QTimer
+        t = QTimer(self)
+        t.timeout.connect(lambda: _th.Thread(
+            target=self._sample_tracker_state, daemon=True).start())
+        t.start(interval_ms)
+        self._sampler_timer = t
+
+    def _sample_tracker_state(self):
+        try:
+            js = (
+                "(function(){var out={};"
+                "out.installed=!!window.__invoiceTrackerInstalled;"
+                "try{out.selectedCount=Object.keys(JSON.parse(localStorage.getItem('invoice_selected')||'{}')).length;}catch(e){out.selectedCount=-1;}"
+                "out.sessStart=localStorage.getItem('invoice_session_start')||'';"
+                "var rows=document.querySelectorAll('div[class*=list-item]');"
+                "out.domRows=rows.length;"
+                "var dc=0;"
+                "for(var i=0;i<rows.length;i++){"
+                "var el=rows[i];"
+                "if(el.querySelector('.ui-checkbox-icon-checked')){dc++;continue;}"
+                "if(el.querySelector('.checkbox-checked,.checkbox-selected,.checked-icon')){dc++;continue;}"
+                "if(/mail-item-checked|item-checked|selected-item|checked-row/.test(el.className||'')){dc++;continue;}"
+                "var cb=el.querySelector('input[type=checkbox]');"
+                "if(cb&&cb.checked)dc++;"
+                "}"
+                "out.domChecked=dc;"
+                "out.href=location.href;"
+                "return JSON.stringify(out);})()"
+            )
+            val = self.run_js(js, timeout=3000)
+            if isinstance(val, str) and val.startswith("{"):
+                d = json.loads(val)
+                d["ts"] = int(time.time())
+                msgid_service.set_diag_state(d)
+                # 自愈：页面跳转/重载后 tracker 丢失，自动补注入（最多 2 秒内恢复）
+                if not d.get("installed"):
+                    self._inject_tracker_now()
+        except Exception as e:
+            self._diag_log(f"SAMPLER err: {e}")
+
+    @staticmethod
+    def _diag_log(msg):
+        try:
+            import os as _os
+            with open(_os.path.join(r"D:\AI\git\invoice-helper", "crash_diag.log"),
+                      "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
     # ---------- 勾选读取（与旧版完全一致） ----------
     def get_selected_mails(self, keep_selection=True):
         js = SELECTED_MAILS_JS % ("true" if keep_selection else "false")
         try:
             value = self.run_js_obj(js, timeout=15000)
         except Exception:
+            self._diag_log("GET_SELECTED err: run_js 失败")
             return []
         if not isinstance(value, list):
+            self._diag_log(f"GET_SELECTED 返回非列表: {str(value)[:80]}")
             return []
         mails = []
         for d in value:
@@ -573,4 +697,5 @@ class WebClient(QObject):
                 "message_id": (d.get("message_id", "") or "").strip(),
                 "text": fulltext or (subject + " " + sender),
             })
+        self._diag_log(f"GET_SELECTED 返回 {len(mails)} 封（原始 {len(value)} 条）")
         return mails

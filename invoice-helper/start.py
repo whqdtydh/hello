@@ -6,6 +6,12 @@ LOG = os.path.join(os.environ["TEMP"], "invoice_crash.log")
 DIAG = r"D:\AI\git\invoice-helper\crash_diag.log"
 
 faulthandler.enable(open(DIAG, "w"))
+# 每 30 秒自动转储所有线程栈（排查无声崩溃/卡死：死前最后一份栈即案发现场）
+STACKS = os.path.join(os.environ["TEMP"], "invoice_stacks.log")
+try:
+    faulthandler.dump_traceback_later(30, repeat=True, file=open(STACKS, "a"))
+except Exception:
+    pass
 
 def _log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"

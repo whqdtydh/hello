@@ -25,6 +25,22 @@ HOST = "127.0.0.1"
 PORT = 18765
 DB_FILE = os.path.join(os.path.expanduser("~"), ".invoice_assistant", "msgid_db.sqlite3")
 
+# ---------- 诊断状态缓存（应用内部采样写入，外部 HTTP 只读查询，避免外部连 CDP 干扰运行） ----------
+DIAG_STATE = {}
+_DIAG_LOCK = threading.Lock()
+
+
+def set_diag_state(d):
+    """由应用内部定时采样器写入页面/勾选状态快照。"""
+    with _DIAG_LOCK:
+        DIAG_STATE.clear()
+        DIAG_STATE.update(d)
+
+
+def get_diag_state():
+    with _DIAG_LOCK:
+        return dict(DIAG_STATE)
+
 
 def _connect():
     conn = sqlite3.connect(DB_FILE)
@@ -215,6 +231,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "data": all_records()})
         elif u.path == "/pending":
             self._send(200, {"ok": True, "data": pending_preload()})
+        elif u.path == "/diag":
+            self._send(200, {"ok": True, "data": get_diag_state()})
         else:
             self._send(404, {"ok": False, "error": "unknown"})
         self._save = None

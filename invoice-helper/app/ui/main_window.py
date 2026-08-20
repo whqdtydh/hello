@@ -827,6 +827,15 @@ class MainWindow(QWidget):
         self._start_busy("读取勾选的邮件…")
         # 读取网页中勾选的邮件（click 延迟校验 + DOM 扫描双保险）
         mails = self.web.get_selected_mails()
+        # 落盘日志：勾选数量与样例（排查"勾 1000 下载 2"类问题）
+        try:
+            import datetime as _dt
+            with open(r"D:\AI\git\invoice-helper\crash_diag.log", "a", encoding="utf-8") as _f:
+                _f.write("[%s] 下载流程: 勾选邮件 %d 封\n" % (_dt.datetime.now().strftime("%H:%M:%S"), len(mails)))
+                for _m in mails[:5]:
+                    _f.write("   样例 mailid=%s subj=%r\n" % (_m.get("mailid", "")[:60], (_m.get("subject") or "")[:30]))
+        except Exception:
+            pass
         if not mails:
             self._stop_busy()
             self._set_status("无勾选邮件", "error")
@@ -859,6 +868,12 @@ class MainWindow(QWidget):
                                          preloader=self.preloader)
             self.api_ctrl = ctrl
             files = ctrl.run(mails, sid=sid)
+            try:
+                import datetime as _dt
+                with open(r"D:\AI\git\invoice-helper\crash_diag.log", "a", encoding="utf-8") as _f:
+                    _f.write("[%s] 下载结果: 成功 %d 个\n" % (_dt.datetime.now().strftime("%H:%M:%S"), len(files)))
+            except Exception:
+                pass
             self.done_signal.emit(files)
         except Exception as e:
             self.log_signal.emit("失败 " + str(e), "")
